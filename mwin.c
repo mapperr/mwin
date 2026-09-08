@@ -26,12 +26,29 @@
 #define VERSION "unknown"
 #endif
 
+/* Keep config.h files from older releases source-compatible. */
+#ifndef COMMAND_KEY
+#define COMMAND_KEY 'o'
+#endif
+#ifndef SHOW_STATUS
+#define SHOW_STATUS 1
+#endif
+#ifndef MAX_WINDOWS
+#define MAX_WINDOWS 32
+#endif
+#ifndef DEFAULT_SCROLLBACK
+#define DEFAULT_SCROLLBACK 2000
+#endif
+#ifndef CHILD_TERM
+#define CHILD_TERM "screen-256color"
+#endif
+
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
 
 #define LEN(a) (sizeof(a) / sizeof((a)[0]))
-#define MINWIN_CTRL(c) ((unsigned char)((c) & 0x1f))
+#define MWIN_CTRL(c) ((unsigned char)((c) & 0x1f))
 #define CSI_MAX 192
 #define OSC_MAX 1024
 #define COMBINING_MAX 3
@@ -73,6 +90,27 @@ struct Cell {
 	struct Attr attr;
 };
 
+struct StyleSpan {
+	int column;
+	struct Attr attr;
+};
+
+struct HistoryLine {
+	char *text;
+	size_t length;
+	struct StyleSpan *spans;
+	size_t span_count;
+};
+
+struct History {
+	struct HistoryLine *lines;
+	size_t capacity;
+	size_t count;
+	size_t head;
+};
+
+struct Terminal;
+
 struct Screen {
 	struct Cell *cells;
 	unsigned char *dirty;
@@ -89,6 +127,8 @@ struct Screen {
 	bool wrap;
 	bool insert;
 	bool wrap_pending;
+	bool records_history;
+	struct Terminal *terminal;
 	struct Attr attr;
 	struct Attr saved_attr;
 };
@@ -120,6 +160,10 @@ struct Terminal {
 	struct Screen *screen;
 	struct Parser parser;
 	struct Buffer input;
+	struct History history;
+	size_t scroll_offset;
+	bool scrolling;
+	bool viewport_dirty;
 	char title[64];
 	bool unread;
 	bool app_cursor;
@@ -142,10 +186,12 @@ static bool running = true;
 static bool prefix_pending;
 static bool help_visible;
 static bool input_is_paste;
-static unsigned char input_sequence[6];
-static size_t input_sequence_length;
+static size_t paste_match_length;
+static unsigned char scroll_escape_sequence[6];
+static size_t scroll_escape_length;
 static bool status_enabled = SHOW_STATUS != 0;
-static unsigned char command_prefix = MINWIN_CTRL(COMMAND_KEY);
+static unsigned char command_prefix = MWIN_CTRL(COMMAND_KEY);
+static size_t scrollback_limit = DEFAULT_SCROLLBACK;
 static int host_rows = 24;
 static int host_cols = 80;
 static int signal_pipe[2] = {-1, -1};
@@ -156,6 +202,8 @@ static void render(bool full);
 static void resize_all(void);
 static void remove_window(size_t index, bool terminate);
 static void normalize_row(struct Screen *screen, int row);
+static void history_push(struct Terminal *terminal, const struct Cell *cells, int columns);
+static void history_clear(struct Terminal *terminal);
 
 static struct Attr
 default_attr(void)
@@ -343,7 +391,7 @@ normalize_row(struct Screen *screen, int row)
 }
 
 static void
-scroll_up(struct Screen *screen, int count)
+scroll_up(struct Screen *screen, int count, bool record)
 {
 	int top = screen->scroll_top;
 	int bottom = screen->scroll_bottom;
@@ -354,6 +402,11 @@ scroll_up(struct Screen *screen, int count)
 		count = 1;
 	if (count > height)
 		count = height;
+	if (record && screen->records_history && screen->terminal != NULL &&
+	    top == 0 && bottom == screen->rows - 1) {
+		for (row = 0; row < count; row++)
+			history_push(screen->terminal, cell_at(screen, row, 0), screen->cols);
+	}
 	if (count < height)
 		memmove(cell_at(screen, top, 0), cell_at(screen, top + count, 0),
 		        (size_t)(height - count) * (size_t)screen->cols * sizeof(struct Cell));
@@ -388,7 +441,7 @@ static void
 screen_index(struct Screen *screen)
 {
 	if (screen->row == screen->scroll_bottom)
-		scroll_up(screen, 1);
+		scroll_up(screen, 1, true);
 	else if (screen->row < screen->rows - 1)
 		screen->row++;
 	screen->wrap_pending = false;
@@ -478,7 +531,7 @@ delete_lines(struct Screen *screen, int count)
 		return;
 	old_top = screen->scroll_top;
 	screen->scroll_top = screen->row;
-	scroll_up(screen, count);
+	scroll_up(screen, count, false);
 	screen->scroll_top = old_top;
 }
 
@@ -925,7 +978,10 @@ handle_csi(struct Terminal *terminal, char final)
 		screen->wrap_pending = false;
 		break;
 	case 'J':
-		erase_display(screen, parameter(p, count, 0, 0));
+		if (parameter(p, count, 0, 0) == 3)
+			history_clear(terminal);
+		else
+			erase_display(screen, parameter(p, count, 0, 0));
 		break;
 	case 'K':
 		erase_line(screen, parameter(p, count, 0, 0));
@@ -947,7 +1003,7 @@ handle_csi(struct Terminal *terminal, char final)
 		delete_lines(screen, amount);
 		break;
 	case 'S':
-		scroll_up(screen, amount);
+		scroll_up(screen, amount, true);
 		break;
 	case 'T':
 		scroll_down(screen, amount);
@@ -1035,6 +1091,7 @@ finish_osc(struct Terminal *terminal)
 static void
 terminal_reset(struct Terminal *terminal)
 {
+	history_clear(terminal);
 	screen_reset(&terminal->primary);
 	screen_reset(&terminal->alternate);
 	terminal->screen = &terminal->primary;
@@ -1352,6 +1409,139 @@ append_codepoint(struct Buffer *output, uint32_t cp)
 	(void)buffer_append(output, encoded, length);
 }
 
+static bool
+cell_is_empty(const struct Cell *cell)
+{
+	return cell->cp == ' ' && cell->ncombining == 0 && cell->width == 1 &&
+	       attr_equal(cell->attr, default_attr());
+}
+
+static void
+history_line_free(struct HistoryLine *line)
+{
+	free(line->text);
+	free(line->spans);
+	memset(line, 0, sizeof(*line));
+}
+
+static void
+history_push(struct Terminal *terminal, const struct Cell *cells, int columns)
+{
+	struct History *history = &terminal->history;
+	struct HistoryLine line;
+	struct Buffer text = {0};
+	struct StyleSpan *spans = NULL;
+	struct Attr previous = default_attr();
+	size_t span_count = 0;
+	size_t index;
+	int last = 0;
+	int col;
+	bool overwriting;
+	bool viewing_oldest;
+
+	if (history->capacity == 0)
+		return;
+	for (col = 0; col < columns; col++) {
+		const struct Cell *cell = &cells[col];
+		if (cell->width != 0 && !cell_is_empty(cell))
+			last = col + cell->width;
+	}
+	if (last > 0) {
+		spans = calloc((size_t)last, sizeof(*spans));
+		if (spans == NULL)
+			return;
+	}
+	for (col = 0; col < last; col++) {
+		const struct Cell *cell = &cells[col];
+		unsigned int combining;
+		if (cell->width == 0)
+			continue;
+		if (!attr_equal(previous, cell->attr)) {
+			spans[span_count].column = col;
+			spans[span_count].attr = cell->attr;
+			span_count++;
+			previous = cell->attr;
+		}
+		append_codepoint(&text, cell->cp == 0 ? ' ' : cell->cp);
+		for (combining = 0; combining < cell->ncombining; combining++)
+			append_codepoint(&text, cell->combining[combining]);
+	}
+	memset(&line, 0, sizeof(line));
+	if (span_count == 0) {
+		free(spans);
+		spans = NULL;
+	} else {
+		struct StyleSpan *smaller = realloc(spans, span_count * sizeof(*spans));
+		if (smaller != NULL)
+			spans = smaller;
+	}
+	line.text = (char *)text.data;
+	line.length = text.length;
+	line.spans = spans;
+	line.span_count = span_count;
+	if (history->lines == NULL) {
+		history->lines = calloc(history->capacity, sizeof(*history->lines));
+		if (history->lines == NULL) {
+			history->capacity = 0;
+			history_line_free(&line);
+			return;
+		}
+	}
+	overwriting = history->count == history->capacity;
+	viewing_oldest = terminal->scrolling &&
+	                 terminal->scroll_offset == history->count;
+	if (overwriting) {
+		index = history->head;
+		history_line_free(&history->lines[index]);
+		history->head = (history->head + 1) % history->capacity;
+	} else {
+		index = (history->head + history->count) % history->capacity;
+		history->count++;
+	}
+	history->lines[index] = line;
+	if (terminal->scrolling) {
+		if (terminal->scroll_offset < history->count)
+			terminal->scroll_offset++;
+		if (overwriting && viewing_oldest)
+			terminal->viewport_dirty = true;
+	}
+}
+
+static void
+history_clear(struct Terminal *terminal)
+{
+	struct History *history = &terminal->history;
+	size_t i;
+
+	if (history->lines != NULL) {
+		for (i = 0; i < history->capacity; i++)
+			history_line_free(&history->lines[i]);
+	}
+	history->count = 0;
+	history->head = 0;
+	terminal->scroll_offset = 0;
+	terminal->scrolling = false;
+	terminal->viewport_dirty = true;
+	if (terminal->screen != NULL)
+		mark_all_dirty(terminal->screen);
+}
+
+static void
+history_free(struct Terminal *terminal)
+{
+	history_clear(terminal);
+	free(terminal->history.lines);
+	memset(&terminal->history, 0, sizeof(terminal->history));
+}
+
+static const struct HistoryLine *
+history_line(const struct History *history, size_t index)
+{
+	if (history->lines == NULL || index >= history->count)
+		return NULL;
+	return &history->lines[(history->head + index) % history->capacity];
+}
+
 static void
 append_attr(struct Buffer *output, struct Attr attr)
 {
@@ -1392,14 +1582,15 @@ append_attr(struct Buffer *output, struct Attr attr)
 }
 
 static void
-append_screen_row(struct Buffer *output, struct Screen *screen, int row)
+append_screen_row(struct Buffer *output, struct Screen *screen, int source_row,
+                  int display_row)
 {
 	struct Attr previous = {0, 0, UINT32_MAX};
 	int col;
 
-	(void)output_printf(output, "\033[%d;1H", row + 1);
+	(void)output_printf(output, "\033[%d;1H", display_row + 1);
 	for (col = 0; col < screen->cols; col++) {
-		struct Cell *cell = cell_at(screen, row, col);
+		struct Cell *cell = cell_at(screen, source_row, col);
 		unsigned int i;
 		if (cell->width == 0)
 			continue;
@@ -1414,6 +1605,140 @@ append_screen_row(struct Buffer *output, struct Screen *screen, int row)
 	(void)output_append(output, "\033[0m");
 }
 
+static bool
+decode_utf8(const char *text, size_t length, size_t *offset, uint32_t *codepoint)
+{
+	const unsigned char *bytes = (const unsigned char *)text;
+	unsigned char first;
+	uint32_t cp;
+	size_t need;
+	size_t i;
+
+	if (*offset >= length)
+		return false;
+	first = bytes[*offset];
+	if (first < 0x80) {
+		*codepoint = first;
+		(*offset)++;
+		return true;
+	}
+	if ((first & 0xe0u) == 0xc0u) {
+		cp = first & 0x1fu;
+		need = 1;
+	} else if ((first & 0xf0u) == 0xe0u) {
+		cp = first & 0x0fu;
+		need = 2;
+	} else if ((first & 0xf8u) == 0xf0u) {
+		cp = first & 0x07u;
+		need = 3;
+	} else {
+		*codepoint = 0xfffdu;
+		(*offset)++;
+		return true;
+	}
+	if (*offset + need >= length) {
+		*codepoint = 0xfffdu;
+		(*offset)++;
+		return true;
+	}
+	for (i = 1; i <= need; i++) {
+		unsigned char byte = bytes[*offset + i];
+		if ((byte & 0xc0u) != 0x80u) {
+			*codepoint = 0xfffdu;
+			(*offset)++;
+			return true;
+		}
+		cp = (cp << 6) | (uint32_t)(byte & 0x3fu);
+	}
+	*offset += need + 1;
+	*codepoint = cp;
+	return true;
+}
+
+static void
+append_history_row(struct Buffer *output, const struct HistoryLine *line,
+                   int display_row, int columns)
+{
+	struct Attr current = default_attr();
+	size_t offset = 0;
+	size_t span = 0;
+	int column = 0;
+
+	(void)output_printf(output, "\033[%d;1H", display_row + 1);
+	append_attr(output, current);
+	if (line != NULL) {
+		while (offset < line->length && column < columns) {
+			size_t start = offset;
+			uint32_t cp;
+			int width;
+			if (!decode_utf8(line->text, line->length, &offset, &cp))
+				break;
+			width = wcwidth((wchar_t)cp);
+			if (width < 0)
+				width = 1;
+			if (width > 0)
+				while (span < line->span_count &&
+				       line->spans[span].column <= column) {
+					current = line->spans[span].attr;
+					append_attr(output, current);
+					span++;
+				}
+			if (width > 0 && column + width > columns)
+				break;
+			(void)buffer_append(output, line->text + start, offset - start);
+			column += width;
+		}
+	}
+	if (!attr_equal(current, default_attr()))
+		append_attr(output, default_attr());
+	while (column < columns) {
+		(void)buffer_append(output, " ", 1);
+		column++;
+	}
+	(void)output_append(output, "\033[0m");
+}
+
+static void
+append_viewport(struct Buffer *output, struct Terminal *terminal)
+{
+	struct Screen *screen = terminal->screen;
+	size_t first = terminal->history.count - terminal->scroll_offset;
+	int display_row;
+
+	for (display_row = 0; display_row < screen->rows; display_row++) {
+		size_t line = first + (size_t)display_row;
+		if (line < terminal->history.count) {
+			append_history_row(output, history_line(&terminal->history, line),
+			                   display_row, screen->cols);
+		} else {
+			size_t source = line - terminal->history.count;
+			if (source < (size_t)screen->rows)
+				append_screen_row(output, screen, (int)source, display_row);
+			else
+				append_history_row(output, NULL, display_row, screen->cols);
+		}
+	}
+}
+
+static const char *
+key_text(unsigned char key, char text[4])
+{
+	if (key < 32) {
+		text[0] = '^';
+		text[1] = (char)(key + '@');
+		text[2] = '\0';
+		return text;
+	}
+	if (key == 127)
+		return "^?";
+	if (isprint(key)) {
+		text[0] = (char)key;
+		text[1] = '\0';
+		return text;
+	}
+	return "?";
+}
+
 static void
 append_status(struct Buffer *output)
 {
@@ -1424,7 +1749,25 @@ append_status(struct Buffer *output)
 
 	if (!status_enabled || host_rows < 2)
 		return;
-	for (i = 0; i < window_count && used + 8 < sizeof(status); i++) {
+	if (prefix_pending) {
+		char key[4];
+		int written = snprintf(status, sizeof(status),
+		                       " prefix %s: waiting for key",
+		                       key_text(command_prefix, key));
+		if (written > 0)
+			used = (size_t)written < sizeof(status) ?
+			       (size_t)written : sizeof(status) - 1;
+	} else if (windows[active_window]->scrolling) {
+		const char *title = windows[active_window]->title[0] == '\0' ?
+		                    "shell" : windows[active_window]->title;
+		int written = snprintf(status, sizeof(status),
+		                       "[%zu:%s] scroll %zu/%zu  ^U/^D page  y/e line  g/G oldest/live  Esc exit",
+		                       active_window + 1, title,
+		                       windows[active_window]->scroll_offset,
+		                       windows[active_window]->history.count);
+		if (written > 0)
+			used = (size_t)written < sizeof(status) ? (size_t)written : sizeof(status) - 1;
+	} else for (i = 0; i < window_count && used + 8 < sizeof(status); i++) {
 		const char *title = windows[i]->title[0] == '\0' ? "shell" : windows[i]->title;
 		int written = snprintf(status + used, sizeof(status) - used,
 		                       "%s%s%zu:%s%s",
@@ -1455,26 +1798,13 @@ append_help(struct Buffer *output)
 {
 	char help[256];
 	char key[4];
-	const char *key_text;
+	const char *prefix_text;
 	size_t length;
 
-	if (command_prefix < 32) {
-		key[0] = '^';
-		key[1] = (char)(command_prefix + '@');
-		key[2] = '\0';
-		key_text = key;
-	} else if (command_prefix == 127) {
-		key_text = "^?";
-	} else if (isprint(command_prefix)) {
-		key[0] = (char)command_prefix;
-		key[1] = '\0';
-		key_text = key;
-	} else {
-		key_text = "?";
-	}
+	prefix_text = key_text(command_prefix, key);
 	(void)snprintf(help, sizeof(help),
-	               " %s c:new  m:mtm  n/p:next/prev  1-0:select  x:close  l:redraw  %s:send ",
-	               key_text, key_text);
+	               " %s m:new  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  %s:send ",
+	               prefix_text, prefix_text);
 	length = strlen(help);
 
 	if ((int)length > host_cols)
@@ -1557,16 +1887,23 @@ render(bool full)
 		mark_all_dirty(screen);
 	}
 	append_host_modes(&output, terminal);
-	for (row = 0; row < screen->rows; row++) {
-		if (screen->dirty[row]) {
-			append_screen_row(&output, screen, row);
-			screen->dirty[row] = 0;
+	if (terminal->scrolling) {
+		if (full || terminal->viewport_dirty) {
+			append_viewport(&output, terminal);
+			terminal->viewport_dirty = false;
+		}
+	} else {
+		for (row = 0; row < screen->rows; row++) {
+			if (screen->dirty[row]) {
+				append_screen_row(&output, screen, row, row);
+				screen->dirty[row] = 0;
+			}
 		}
 	}
 	append_status(&output);
 	if (help_visible)
 		append_help(&output);
-	if (screen->cursor_visible && !help_visible) {
+	if (screen->cursor_visible && !help_visible && !terminal->scrolling) {
 		(void)output_printf(&output, "\033[%d;%dH\033[?25h",
 		                    screen->row + 1, screen->col + 1);
 	} else {
@@ -1712,9 +2049,9 @@ spawn_terminal(char *const argv[])
 		(void)sigaction(SIGTERM, &action, NULL);
 		(void)sigaction(SIGHUP, &action, NULL);
 		(void)setenv("TERM", CHILD_TERM, 1);
-		(void)setenv("MINWIN", "1", 1);
+		(void)setenv("MWIN", "1", 1);
 		execvp(argv[0], argv);
-		(void)dprintf(STDERR_FILENO, "minwin: cannot execute %s: %s\r\n",
+		(void)dprintf(STDERR_FILENO, "mwin: cannot execute %s: %s\r\n",
 		              argv[0], strerror(errno));
 		_exit(127);
 	}
@@ -1733,6 +2070,7 @@ spawn_terminal(char *const argv[])
 	terminal->fd = master;
 	terminal->pid = pid;
 	terminal->parser.state = P_GROUND;
+	terminal->history.capacity = scrollback_limit;
 	(void)snprintf(terminal->title, sizeof(terminal->title), "%s", base_name(argv[0]));
 	if (!screen_init(&terminal->primary, size.ws_row, size.ws_col) ||
 	    !screen_init(&terminal->alternate, size.ws_row, size.ws_col)) {
@@ -1744,6 +2082,9 @@ spawn_terminal(char *const argv[])
 		(void)kill(pid, SIGHUP);
 		return NULL;
 	}
+	terminal->primary.records_history = true;
+	terminal->primary.terminal = terminal;
+	terminal->alternate.terminal = terminal;
 	terminal->screen = &terminal->primary;
 	return terminal;
 }
@@ -1776,6 +2117,7 @@ free_terminal(struct Terminal *terminal, bool terminate)
 	close(terminal->fd);
 	screen_free(&terminal->primary);
 	screen_free(&terminal->alternate);
+	history_free(terminal);
 	buffer_free(&terminal->input);
 	free(terminal);
 }
@@ -1847,18 +2189,78 @@ new_shell(void)
 	}
 }
 
-static void
-new_splitter(void)
+static size_t
+scroll_page(const struct Terminal *terminal)
 {
-	const char *command = getenv("MINWIN_MTM");
-	char *arguments[2];
-	if (command == NULL || *command == '\0')
-		command = SPLIT_COMMAND;
-	arguments[0] = (char *)command;
-	arguments[1] = NULL;
-	if (!add_window(arguments)) {
-		ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
-		(void)ignored;
+	return terminal->screen->rows > 1 ? (size_t)(terminal->screen->rows - 1) : 1;
+}
+
+static void
+scroll_backward(struct Terminal *terminal, size_t amount)
+{
+	if (terminal->screen != &terminal->primary || terminal->history.count == 0)
+		return;
+	terminal->scrolling = true;
+	if (amount > terminal->history.count - terminal->scroll_offset)
+		terminal->scroll_offset = terminal->history.count;
+	else
+		terminal->scroll_offset += amount;
+	terminal->viewport_dirty = true;
+	render(true);
+}
+
+static void
+scroll_to_live(struct Terminal *terminal)
+{
+	bool changed = terminal->scrolling;
+	terminal->scrolling = false;
+	terminal->scroll_offset = 0;
+	terminal->viewport_dirty = false;
+	if (changed)
+		render(true);
+}
+
+static void
+scroll_forward(struct Terminal *terminal, size_t amount)
+{
+	if (!terminal->scrolling)
+		return;
+	if (amount >= terminal->scroll_offset) {
+		scroll_to_live(terminal);
+		return;
+	}
+	terminal->scroll_offset -= amount;
+	terminal->viewport_dirty = true;
+	render(true);
+}
+
+static void
+handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
+{
+	switch (byte) {
+	case MWIN_CTRL('u'):
+		scroll_backward(terminal, scroll_page(terminal));
+		break;
+	case MWIN_CTRL('d'):
+		scroll_forward(terminal, scroll_page(terminal));
+		break;
+	case 'y':
+		scroll_backward(terminal, 1);
+		break;
+	case 'e':
+		scroll_forward(terminal, 1);
+		break;
+	case 'g':
+		terminal->scroll_offset = terminal->history.count;
+		terminal->viewport_dirty = true;
+		render(true);
+		break;
+	case 'G':
+	case '\033':
+		scroll_to_live(terminal);
+		break;
+	default:
+		break;
 	}
 }
 
@@ -1872,24 +2274,24 @@ handle_command(unsigned char byte)
 		return;
 	}
 	switch (byte) {
-	case 'c':
+	case 'm':
 		new_shell();
 		break;
-	case 'm':
-		new_splitter();
-		break;
-	case 'n':
+	case MWIN_CTRL('n'):
 		select_window((active_window + 1) % window_count);
 		break;
-	case 'p':
+	case MWIN_CTRL('p'):
 		select_window((active_window + window_count - 1) % window_count);
 		break;
-	case 'x':
+	case MWIN_CTRL('x'):
 		remove_window(active_window, true);
 		break;
-	case 'l':
+	case MWIN_CTRL('l'):
 		help_visible = false;
 		render(true);
+		break;
+	case MWIN_CTRL('u'):
+		scroll_backward(windows[active_window], scroll_page(windows[active_window]));
 		break;
 	case '?':
 		help_visible = true;
@@ -1916,56 +2318,95 @@ handle_regular_input(unsigned char byte)
 		render(true);
 		return;
 	}
+	if (windows[active_window]->scrolling) {
+		handle_scrollback_key(windows[active_window], byte);
+		return;
+	}
 	if (prefix_pending) {
 		prefix_pending = false;
 		handle_command(byte);
+		if (status_enabled)
+			render(false);
 	} else if (byte == command_prefix) {
 		prefix_pending = true;
+		if (status_enabled)
+			render(false);
 	} else {
 		(void)buffer_append(&windows[active_window]->input, &byte, 1);
 	}
 }
 
 static void
-flush_input_sequence(bool literal)
+observe_paste_byte(unsigned char byte)
+{
+	static const unsigned char paste_begin[] = "\033[200~";
+	static const unsigned char paste_end[] = "\033[201~";
+	const unsigned char *wanted = input_is_paste ? paste_end : paste_begin;
+	const size_t wanted_length = sizeof(paste_begin) - 1;
+
+	if (byte == wanted[paste_match_length])
+		paste_match_length++;
+	else
+		paste_match_length = byte == wanted[0] ? 1 : 0;
+	if (paste_match_length == wanted_length) {
+		input_is_paste = !input_is_paste;
+		paste_match_length = 0;
+	}
+}
+
+static void
+handle_live_input(unsigned char byte)
+{
+	if (input_is_paste)
+		(void)buffer_append(&windows[active_window]->input, &byte, 1);
+	else
+		handle_regular_input(byte);
+	observe_paste_byte(byte);
+}
+
+static void
+flush_scroll_escape(void)
 {
 	size_t i;
-	if (literal) {
-		(void)buffer_append(&windows[active_window]->input,
-		                    input_sequence, input_sequence_length);
-	} else {
-		for (i = 0; i < input_sequence_length && running; i++)
-			handle_regular_input(input_sequence[i]);
-	}
-	input_sequence_length = 0;
+
+	/* The first Escape already served as the scrollback-exit command. */
+	for (i = 1; i < scroll_escape_length && running; i++)
+		handle_live_input(scroll_escape_sequence[i]);
+	scroll_escape_length = 0;
 }
 
 static void
 handle_input(const unsigned char *data, size_t length)
 {
 	static const unsigned char paste_begin[] = "\033[200~";
-	static const unsigned char paste_end[] = "\033[201~";
 	size_t i;
 
 	for (i = 0; i < length && running; i++) {
-		const unsigned char *wanted = input_is_paste ? paste_end : paste_begin;
 		unsigned char byte = data[i];
 
-		if (input_sequence_length == 0 && byte != '\033') {
-			if (input_is_paste)
-				(void)buffer_append(&windows[active_window]->input, &byte, 1);
-			else
-				handle_regular_input(byte);
+		if (scroll_escape_length != 0) {
+			scroll_escape_sequence[scroll_escape_length++] = byte;
+			if (memcmp(scroll_escape_sequence, paste_begin,
+			           scroll_escape_length) != 0) {
+				flush_scroll_escape();
+			} else if (scroll_escape_length == sizeof(paste_begin) - 1) {
+				(void)buffer_append(&windows[active_window]->input,
+				                    scroll_escape_sequence, scroll_escape_length);
+				scroll_escape_length = 0;
+				paste_match_length = 0;
+				input_is_paste = true;
+			}
 			continue;
 		}
-		if (input_sequence_length < sizeof(input_sequence))
-			input_sequence[input_sequence_length++] = byte;
-		if (memcmp(input_sequence, wanted, input_sequence_length) != 0) {
-			flush_input_sequence(input_is_paste);
-		} else if (input_sequence_length == sizeof(paste_begin) - 1) {
-			flush_input_sequence(true);
-			input_is_paste = !input_is_paste;
+		if (!input_is_paste && byte == '\033' &&
+		    windows[active_window]->scrolling) {
+			handle_regular_input(byte);
+			scroll_escape_sequence[0] = byte;
+			scroll_escape_length = 1;
+			paste_match_length = 0;
+			continue;
 		}
+		handle_live_input(byte);
 	}
 }
 
@@ -2156,7 +2597,7 @@ event_loop(void)
 				descriptors[count].events |= POLLOUT;
 			descriptors[count++].revents = 0;
 		}
-		result = poll(descriptors, count, -1);
+		result = poll(descriptors, count, scroll_escape_length == 0 ? -1 : 30);
 		if (result < 0) {
 			if (errno == EINTR) {
 				if (received_signal != 0)
@@ -2164,6 +2605,10 @@ event_loop(void)
 				continue;
 			}
 			break;
+		}
+		if (result == 0) {
+			flush_scroll_escape();
+			continue;
 		}
 		if ((descriptors[1].revents & POLLIN) != 0)
 			handle_signals();
@@ -2224,27 +2669,60 @@ parse_key(const char *text)
 	long value;
 
 	if (text[0] == '^' && text[1] != '\0' && text[2] == '\0')
-		return MINWIN_CTRL((unsigned char)toupper((unsigned char)text[1]));
+		return MWIN_CTRL((unsigned char)toupper((unsigned char)text[1]));
 	if (text[0] != '\0' && text[1] == '\0')
 		return (unsigned char)text[0];
 	errno = 0;
 	value = strtol(text, &end, 10);
 	if (errno == 0 && *end == '\0' && value >= 0 && value <= 255)
 		return (unsigned char)value;
-	fprintf(stderr, "minwin: invalid command key: %s\n", text);
+	fprintf(stderr, "mwin: invalid command key: %s\n", text);
 	exit(2);
+}
+
+static size_t
+scrollback_from_environment(void)
+{
+	const char *text = getenv("MWIN_SCROLLBACK");
+	const char *cursor;
+	char *end;
+	unsigned long long value;
+
+	if (text == NULL)
+		return DEFAULT_SCROLLBACK;
+	if (text[0] == '\0') {
+		fprintf(stderr, "mwin: invalid MWIN_SCROLLBACK value: %s\n", text);
+		exit(2);
+	}
+	for (cursor = text; *cursor != '\0'; cursor++)
+		if (!isdigit((unsigned char)*cursor)) {
+			fprintf(stderr, "mwin: invalid MWIN_SCROLLBACK value: %s\n", text);
+			exit(2);
+		}
+	errno = 0;
+	value = strtoull(text, &end, 10);
+	if (*end != '\0' || errno == ERANGE || value > SIZE_MAX) {
+		fprintf(stderr, "mwin: invalid MWIN_SCROLLBACK value: %s\n", text);
+		exit(2);
+	}
+	return (size_t)value;
 }
 
 static int
 self_test(void)
 {
 	struct Terminal terminal;
+	struct Terminal history_terminal;
 	struct Screen *screen;
+	const struct HistoryLine *line;
 	const unsigned char basic[] = "abc\033[2;2HZ\033[31mR\033[0m";
 	const unsigned char alternate[] = "\033[?1049hALT\033[?1049l";
 	const unsigned char erase[] = "\033[2J\033[Hok";
 	const unsigned char line_drawing[] = "\033(0lqk\033(B";
-	const unsigned char pasted[] = "\033[200~\001x\033[201~";
+	const unsigned char pasted[] = "\033[200~\r\030\033[201~";
+	const unsigned char scrolling[] = "a\r\n\033[31mb\033[0m\r\nc\r\nd\r\n";
+	const unsigned char alternate_scrolling[] = "\033[?1049h1\r\n2\r\n3\r\n\033[?1049l";
+	const unsigned char clear_history[] = "\033[3J";
 	int failed = 0;
 
 	memset(&terminal, 0, sizeof(terminal));
@@ -2278,18 +2756,56 @@ self_test(void)
 	windows[0] = &terminal;
 	window_count = 1;
 	active_window = 0;
-	command_prefix = MINWIN_CTRL('a');
+	command_prefix = MWIN_CTRL('m');
 	input_is_paste = false;
-	input_sequence_length = 0;
+	paste_match_length = 0;
+	scroll_escape_length = 0;
 	prefix_pending = false;
 	handle_input(pasted, sizeof(pasted) - 1);
 	if (window_count != 1 || input_is_paste || terminal.input.length != sizeof(pasted) - 1 ||
 	    memcmp(terminal.input.data, pasted, sizeof(pasted) - 1) != 0)
 		failed = 1;
+	{
+		const unsigned char escape[] = "\033";
+		size_t before = terminal.input.length;
+		handle_input(escape, sizeof(escape) - 1);
+		if (terminal.input.length != before + 1 ||
+		    terminal.input.data[before] != '\033' || scroll_escape_length != 0)
+			failed = 1;
+	}
 	window_count = 0;
 	buffer_free(&terminal.input);
 	screen_free(&terminal.primary);
 	screen_free(&terminal.alternate);
+	memset(&history_terminal, 0, sizeof(history_terminal));
+	history_terminal.history.capacity = 2;
+	if (!screen_init(&history_terminal.primary, 2, 4) ||
+	    !screen_init(&history_terminal.alternate, 2, 4)) {
+		fprintf(stderr, "self-test: history allocation failed\n");
+		return 1;
+	}
+	history_terminal.primary.records_history = true;
+	history_terminal.primary.terminal = &history_terminal;
+	history_terminal.screen = &history_terminal.primary;
+	history_terminal.parser.state = P_GROUND;
+	feed_bytes(&history_terminal, scrolling, sizeof(scrolling) - 1);
+	line = history_line(&history_terminal.history, 0);
+	if (history_terminal.history.count != 2 || line == NULL || line->length != 1 ||
+	    line->text[0] != 'b' || line->span_count != 1 || line->spans[0].attr.fg != 1)
+		failed = 1;
+	line = history_line(&history_terminal.history, 1);
+	if (line == NULL || line->length != 1 || line->text[0] != 'c' ||
+	    line->span_count != 0)
+		failed = 1;
+	feed_bytes(&history_terminal, alternate_scrolling, sizeof(alternate_scrolling) - 1);
+	if (history_terminal.history.count != 2)
+		failed = 1;
+	feed_bytes(&history_terminal, clear_history, sizeof(clear_history) - 1);
+	if (history_terminal.history.count != 0)
+		failed = 1;
+	history_free(&history_terminal);
+	screen_free(&history_terminal.primary);
+	screen_free(&history_terminal.alternate);
 	if (failed) {
 		fprintf(stderr, "self-test: failed\n");
 		return 1;
@@ -2302,8 +2818,8 @@ static void
 usage(FILE *stream)
 {
 	fprintf(stream,
-	        "usage: minwin [-s] [-c key] [command [argument ...]]\n"
-	        "       minwin -h | -v | --self-test\n");
+	        "usage: mwin [-s] [-c key] [command [argument ...]]\n"
+	        "       mwin -h | -v | --self-test\n");
 }
 
 int
@@ -2332,7 +2848,7 @@ main(int argc, char **argv)
 			usage(stdout);
 			return 0;
 		case 'v':
-			printf("minwin %s\n", VERSION);
+			printf("mwin %s\n", VERSION);
 			return 0;
 		default:
 			usage(stderr);
@@ -2340,9 +2856,10 @@ main(int argc, char **argv)
 		}
 	}
 	if (command_prefix == 0) {
-		fprintf(stderr, "minwin: NUL cannot be used as the command key\n");
+		fprintf(stderr, "mwin: NUL cannot be used as the command key\n");
 		return 2;
 	}
+	scrollback_limit = scrollback_from_environment();
 	enter_terminal();
 	install_signals();
 	resize_all();

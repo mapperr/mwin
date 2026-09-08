@@ -1,20 +1,20 @@
-.TH MINWIN 1 "September 2026" "minwin 0.1.0" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.2.2" "User Commands"
 .SH NAME
-minwin \- minimal fullscreen terminal window manager
+mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
-.B minwin
+.B mwin
 .RB [ \-c " key" ]
 .RB [ \-s ]
 .RI [ command " [" argument " ...]]"
 .SH DESCRIPTION
-.B minwin
+.B mwin
 runs multiple independent pseudo-terminals in one terminal and displays one
-at a time. It provides windows but no split panes and no session server.
-Run it under
+at a time. It provides fullscreen windows and per-window scrollback, but no
+split panes or session server. Run it under
 .BR abduco (1)
-for persistent attach/detach sessions, and run
+for persistent attach/detach sessions. Run
 .BR mtm (1)
-inside a window when split panes are needed.
+as an ordinary command inside a window when split panes are needed.
 .PP
 One row is reserved for a window list unless disabled with
 .BR \-s .
@@ -36,61 +36,100 @@ Print usage and exit.
 Print the version and exit.
 .TP
 .B --self-test
-Run the internal VT-model tests and exit.
-.SH KEYS
+Run internal VT and scrollback tests and exit.
+.SH WINDOW KEYS
 Commands use
-.B Ctrl-a
+.B Ctrl-o
 by default.
 .TP
-.B c
+.B m
 Create a shell window.
 .TP
-.B m
-Create a window running mtm, or the command named by MINWIN_MTM.
-.TP
-.BR n , " p"
+.BR Ctrl-n , " Ctrl-p"
 Select the next or previous window.
 .TP
 .BR 1\-9 , " 0"
 Select window 1 through 10.
 .TP
-.B x
+.B Ctrl-x
 Send SIGHUP to the current window's process group and close it.
 .TP
-.B l
+.B Ctrl-l
 Redraw the screen.
+.TP
+.B Ctrl-u
+Enter scrollback and move one page backward.
 .TP
 .B ?
 Display the key summary until another key is pressed.
 .TP
-.B Ctrl-a
-When entered after the prefix, send a literal Ctrl-a to the application.
+.B Ctrl-o
+When entered after the prefix, send a literal Ctrl-o to the application.
+.PP
+After the prefix is entered, the status line indicates that mwin is waiting for
+a command key. The configured prefix is displayed. No indication is shown when
+the status line is disabled with
+.BR \-s .
+.SH SCROLLBACK KEYS
+Once scrollback is active, the following keys need no prefix:
+.TP
+.B Ctrl-u
+Move one page backward.
+.TP
+.B Ctrl-d
+Move one page forward.
+.TP
+.B y
+Move one row backward.
+.TP
+.B e
+Move one row forward.
+.TP
+.B g
+Move to the oldest retained row.
+.TP
+.B G
+Return to the live terminal.
+.TP
+.B Escape
+Leave scrollback and return to the live terminal.
+.PP
+Incoming output continues to be processed while scrollback is visible. Only
+rows scrolled off the primary screen are retained; alternate-screen activity
+is excluded. Historical rows are not reflowed after a resize.
 .SH ENVIRONMENT
 .TP
 .B SHELL
 Shell used for new windows. The user's login shell and /bin/sh are fallbacks.
 .TP
-.B MINWIN_MTM
-Program started by the
-.B m
-command. The default is mtm.
+.B MWIN_SCROLLBACK
+Maximum number of scrollback rows retained independently for each window.
+The default is 2000. A value of 0 disables scrollback.
 .TP
 .B TERM
 Describes the hosting terminal. Child terminals receive screen-256color by
 default; this is configurable in config.h.
+.TP
+.B MWIN
+Set to 1 in child processes.
 .SH PERSISTENCE
 For a persistent workspace, use:
 .PP
 .RS
-.B abduco -A main minwin
+.B abduco -A main mwin
 .RE
 .PP
-The default abduco detach key is Ctrl-backslash. Minwin keeps its child PTYs
-drained while detached and redraws on terminal resize or with its redraw key.
+The default abduco detach key is Ctrl-backslash. Mwin keeps child PTYs drained
+while detached and redraws on terminal resize or with its redraw key.
 .SH LIMITATIONS
-Minwin has no scrollback, copy mode, detach protocol, split layout, or plugin
-system. OSC clipboard and hyperlink sequences and graphical terminal protocols
-are not passed through.
+Mwin has no search, copy mode, split layout, or plugin system. OSC clipboard
+and hyperlink sequences and graphical terminal protocols are not passed
+through.
+.PP
+Mwin forwards a standalone Escape immediately. A nested ncurses program such
+as mtm may apply its own Escape delay; for mtm this can be shortened, for
+example, with
+.BR "ESCDELAY=25 mtm" .
 .SH SEE ALSO
 .BR abduco (1),
 .BR mtm (1),

@@ -1,16 +1,16 @@
-# minwin
+# mwin
 
-`minwin` is a deliberately small fullscreen terminal window manager. It runs
+`mwin` is a deliberately small fullscreen terminal window manager. It runs
 several independent PTYs inside one terminal, displays one at a time, and
 leaves persistence to [abduco](https://www.brain-dump.org/projects/abduco/)
-and splits to [mtm](https://github.com/deadpixi/mtm).
+and optional split panes to [mtm](https://github.com/deadpixi/mtm).
 
 ```text
-foot -> abduco -> minwin -> shell / editor / mtm
+foot -> abduco -> mwin -> shell / editor / mtm
 ```
 
-It is not a replacement for tmux. There are no panes, layouts, plugins,
-configuration language, server protocol, or permanent scrollback.
+It is not a replacement for tmux. There are no pane layouts, plugins,
+configuration language, server protocol, copy mode, or search mode.
 
 ## Build
 
@@ -33,57 +33,112 @@ sudo make install
 Copy `config.def.h` to `config.h` before building to change compile-time
 defaults. `make` creates the copy automatically when it is absent.
 
+An existing `config.h` remains authoritative across upgrades. Options added by
+newer releases use built-in fallback values when they are absent, so older
+configuration files still compile. To adopt `Ctrl-o` in an upgraded tree, set
+`COMMAND_KEY` to `'o'`; fresh builds already use it.
+
 ## Use
 
 Start a disposable workspace:
 
 ```sh
-minwin
+mwin
 ```
 
 Start or attach to a persistent workspace:
 
 ```sh
-abduco -A main minwin
+abduco -A main mwin
 ```
 
 Run a command in the first window:
 
 ```sh
-minwin ssh server.example.org
+mwin ssh server.example.org
+mwin mtm
 ```
 
-The default command prefix is `Ctrl-a`:
+`mtm` has no special binding: start it like any other program whenever a
+window needs split panes.
+
+`mwin` forwards a standalone `Esc` immediately. If an editor still reacts to
+`Esc` slowly only when it is running inside `mtm`, that delay comes from
+ncurses' escape-sequence disambiguation. A small value keeps special keys
+working while making mode changes nearly immediate:
+
+```sh
+ESCDELAY=25 mtm
+```
+
+## Window keys
+
+The default command prefix is `Ctrl-o`:
 
 | Key | Action |
 | --- | --- |
-| `Ctrl-a c` | create a shell window |
-| `Ctrl-a m` | create a window running `mtm` |
-| `Ctrl-a n` | select next window |
-| `Ctrl-a p` | select previous window |
-| `Ctrl-a 1` … `9`, `0` | select window 1 … 10 |
-| `Ctrl-a x` | close the current window and its process group |
-| `Ctrl-a l` | redraw everything |
-| `Ctrl-a ?` | show the key summary |
-| `Ctrl-a Ctrl-a` | send a literal `Ctrl-a` to the application |
+| `Ctrl-o m` | create a shell window |
+| `Ctrl-o Ctrl-n` | select the next window |
+| `Ctrl-o Ctrl-p` | select the previous window |
+| `Ctrl-o 1` … `9`, `0` | select window 1 … 10 |
+| `Ctrl-o Ctrl-x` | close the current window and its process group |
+| `Ctrl-o Ctrl-l` | redraw everything |
+| `Ctrl-o Ctrl-u` | enter scrollback and move one page backward |
+| `Ctrl-o ?` | show the key summary |
+| `Ctrl-o Ctrl-o` | send a literal `Ctrl-o` to the application |
 
-The prefix can be changed at runtime. `^G`, `g`, and the decimal byte value
+After the prefix is pressed, the status line shows that mwin is waiting for a
+command key. The notice follows a prefix selected with `-c`; it is absent when
+the status line is disabled with `-s`.
+
+The prefix can still be changed at runtime. `^G`, `g`, and decimal byte values
 are accepted:
 
 ```sh
-minwin -c '^G'
+mwin -c '^G'
 ```
 
-`abduco` uses `Ctrl-\\` to detach by default. When `mtm` runs in a minwin
-window, its own default prefix remains `Ctrl-g`.
+`abduco` uses `Ctrl-\\` to detach by default.
+
+## Scrollback
+
+Each window has an independent in-memory history. While browsing it:
+
+| Key | Action |
+| --- | --- |
+| `Ctrl-u` | one page backward |
+| `Ctrl-d` | one page forward |
+| `y` | one row backward |
+| `e` | one row forward |
+| `g` | oldest retained row |
+| `G` | live terminal |
+| `Esc` | leave scrollback and return to the live terminal |
+
+New output continues to be parsed while browsing and the visible position
+remains anchored. The history records only rows that leave the top of the
+primary screen; alternate-screen redraws from editors and pagers do not fill
+it. Old rows keep their original layout after a resize and are clipped or
+padded instead of being reflowed.
+
+Rows are stored compactly as UTF-8 plus style changes. They are allocated only
+as output scrolls. The only limit is the number of rows:
+
+```sh
+MWIN_SCROLLBACK=10000 mwin
+MWIN_SCROLLBACK=0 mwin       # disable history
+```
+
+The default is 2000 rows per window and can be changed in `config.h`.
 
 ## Environment
 
-- `SHELL`: shell created by `Ctrl-a c`; falls back to the login shell and then
+- `SHELL`: shell created by `Ctrl-o m`; falls back to the login shell and then
   `/bin/sh`.
-- `MINWIN_MTM`: split command created by `Ctrl-a m`; defaults to `mtm`.
-- `TERM`: read for the hosting terminal. Children receive the value configured
+- `MWIN_SCROLLBACK`: maximum retained rows per window; defaults to 2000 and
+  accepts `0` to disable history.
+- `TERM`: describes the hosting terminal. Children receive the value configured
   as `CHILD_TERM`, `screen-256color` by default.
+- `MWIN`: set to `1` in child processes.
 
 ## Intentional limits
 
@@ -93,17 +148,18 @@ primary and alternate screens, scroll regions, insert/delete operations,
 256-color and RGB SGR attributes, Unicode cells, bracketed paste, common mouse
 modes, and cursor reports.
 
-It deliberately does not yet provide:
+It deliberately does not provide:
 
-- persistent scrollback or copy mode;
-- window names edited by minwin (OSC titles are displayed automatically);
-- multiple attached clients controlled by minwin itself;
+- scrollback search, text selection, or copy mode;
+- reflow of historical rows after resize;
+- window names edited by mwin (OSC titles are displayed automatically);
+- multiple attached clients controlled by mwin itself;
 - passthrough for OSC 8 hyperlinks, OSC 52 clipboard access, sixel, kitty
   graphics, or kitty's keyboard protocol;
 - perfect grapheme-cluster shaping.
 
-Use `abduco` for persistence. This also means a session can survive closing
-the outer terminal without adding a daemon or socket protocol to minwin.
+Use `abduco` for persistence. The window and scrollback state then survive
+closing the outer terminal without adding a daemon or socket protocol to mwin.
 
 ## Tests
 
@@ -111,5 +167,6 @@ the outer terminal without adding a daemon or socket protocol to minwin.
 make test
 ```
 
-The self-test exercises the VT model. The integration test runs minwin under a
-real pseudo-terminal, creates and closes windows, and verifies clean shutdown.
+The self-test exercises the VT model, compact history, styles, and ring-buffer
+eviction. Integration tests run mwin under a real pseudo-terminal and exercise
+window commands, alternate prefixes, scrollback navigation, and clean shutdown.
