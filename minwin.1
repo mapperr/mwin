@@ -1,0 +1,97 @@
+.TH MINWIN 1 "September 2026" "minwin 0.1.0" "User Commands"
+.SH NAME
+minwin \- minimal fullscreen terminal window manager
+.SH SYNOPSIS
+.B minwin
+.RB [ \-c " key" ]
+.RB [ \-s ]
+.RI [ command " [" argument " ...]]"
+.SH DESCRIPTION
+.B minwin
+runs multiple independent pseudo-terminals in one terminal and displays one
+at a time. It provides windows but no split panes and no session server.
+Run it under
+.BR abduco (1)
+for persistent attach/detach sessions, and run
+.BR mtm (1)
+inside a window when split panes are needed.
+.PP
+One row is reserved for a window list unless disabled with
+.BR \-s .
+.SH OPTIONS
+.TP
+.BI \-c " key"
+Set the command prefix. The argument may be a literal character, caret notation
+such as
+.BR ^G ,
+or a decimal byte value.
+.TP
+.B \-s
+Hide the status line and give every row to the child terminal.
+.TP
+.BR \-h , " --help"
+Print usage and exit.
+.TP
+.B \-v
+Print the version and exit.
+.TP
+.B --self-test
+Run the internal VT-model tests and exit.
+.SH KEYS
+Commands use
+.B Ctrl-a
+by default.
+.TP
+.B c
+Create a shell window.
+.TP
+.B m
+Create a window running mtm, or the command named by MINWIN_MTM.
+.TP
+.BR n , " p"
+Select the next or previous window.
+.TP
+.BR 1\-9 , " 0"
+Select window 1 through 10.
+.TP
+.B x
+Send SIGHUP to the current window's process group and close it.
+.TP
+.B l
+Redraw the screen.
+.TP
+.B ?
+Display the key summary until another key is pressed.
+.TP
+.B Ctrl-a
+When entered after the prefix, send a literal Ctrl-a to the application.
+.SH ENVIRONMENT
+.TP
+.B SHELL
+Shell used for new windows. The user's login shell and /bin/sh are fallbacks.
+.TP
+.B MINWIN_MTM
+Program started by the
+.B m
+command. The default is mtm.
+.TP
+.B TERM
+Describes the hosting terminal. Child terminals receive screen-256color by
+default; this is configurable in config.h.
+.SH PERSISTENCE
+For a persistent workspace, use:
+.PP
+.RS
+.B abduco -A main minwin
+.RE
+.PP
+The default abduco detach key is Ctrl-backslash. Minwin keeps its child PTYs
+drained while detached and redraws on terminal resize or with its redraw key.
+.SH LIMITATIONS
+Minwin has no scrollback, copy mode, detach protocol, split layout, or plugin
+system. OSC clipboard and hyperlink sequences and graphical terminal protocols
+are not passed through.
+.SH SEE ALSO
+.BR abduco (1),
+.BR mtm (1),
+.BR pty (7)
