@@ -27,13 +27,21 @@ run_script() {
 	sleep 0.1
 	printf 'm'
 	sleep 0.1
+	printf '\017o'
+	sleep 0.1
+	printf '\017o'
+	sleep 0.1
 	printf '\017\030'
 	sleep 0.1
 	printf '\017\030'
-} | run_script "$tmp" './mwin'
+} | run_script "$tmp" './mwin sleep 10'
 
 if ! grep -aF 'prefix ^O: waiting for key' "$tmp" >/dev/null; then
 	echo "prefix: pending status not observed" >&2
+	exit 1
+fi
+if ! grep -aF '[1:sleep]  2:' "$tmp" >/dev/null; then
+	echo "windows: previous window was not selected" >&2
 	exit 1
 fi
 

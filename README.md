@@ -78,6 +78,7 @@ The default command prefix is `Ctrl-o`:
 | Key | Action |
 | --- | --- |
 | `Ctrl-o m` | create a shell window |
+| `Ctrl-o o` | return to the previously visited window |
 | `Ctrl-o Ctrl-n` | select the next window |
 | `Ctrl-o Ctrl-p` | select the previous window |
 | `Ctrl-o 1` … `9`, `0` | select window 1 … 10 |
@@ -90,6 +91,10 @@ The default command prefix is `Ctrl-o`:
 After the prefix is pressed, the status line shows that mwin is waiting for a
 command key. The notice follows a prefix selected with `-c`; it is absent when
 the status line is disabled with `-s`.
+
+Repeated `Ctrl-o o` commands toggle between the two most recently visited
+windows. Creating a window counts as visiting it; closing a remembered window
+clears that reference safely.
 
 The prefix can still be changed at runtime. `^G`, `g`, and decimal byte values
 are accepted:

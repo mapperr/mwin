@@ -202,6 +202,7 @@ struct Terminal {
 static struct Terminal *windows[MAX_WINDOWS];
 static size_t window_count;
 static size_t active_window;
+static struct Terminal *previous_window;
 static struct termios original_termios;
 static bool terminal_is_raw;
 static bool running = true;
@@ -2221,7 +2222,7 @@ append_help(struct Buffer *output)
 
 	prefix_text = key_text(command_prefix, key);
 	(void)snprintf(help, sizeof(help),
-	               " %s m:new  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  %s:send ",
+	               " %s m:new  o:last  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  %s:send ",
 	               prefix_text, prefix_text);
 	length = strlen(help);
 
@@ -2517,6 +2518,8 @@ add_window(char *const argv[])
 	terminal = spawn_terminal(argv);
 	if (terminal == NULL)
 		return false;
+	if (window_count != 0)
+		previous_window = windows[active_window];
 	windows[window_count++] = terminal;
 	active_window = window_count - 1;
 	terminal->unread = false;
@@ -2543,11 +2546,15 @@ free_terminal(struct Terminal *terminal, bool terminate)
 static void
 remove_window(size_t index, bool terminate)
 {
+	struct Terminal *removed;
 	size_t i;
 
 	if (index >= window_count)
 		return;
-	free_terminal(windows[index], terminate);
+	removed = windows[index];
+	if (previous_window == removed)
+		previous_window = NULL;
+	free_terminal(removed, terminate);
 	for (i = index; i + 1 < window_count; i++)
 		windows[i] = windows[i + 1];
 	window_count--;
@@ -2559,6 +2566,8 @@ remove_window(size_t index, bool terminate)
 		active_window--;
 	else if (active_window >= window_count)
 		active_window = window_count - 1;
+	if (previous_window == windows[active_window])
+		previous_window = NULL;
 	windows[active_window]->unread = false;
 	help_visible = false;
 	render(true);
@@ -2584,15 +2593,56 @@ find_window_by_pid(pid_t pid)
 	return -1;
 }
 
-static void
-select_window(size_t index)
+static ssize_t
+find_window(struct Terminal *terminal)
+{
+	size_t i;
+
+	for (i = 0; i < window_count; i++)
+		if (windows[i] == terminal)
+			return (ssize_t)i;
+	return -1;
+}
+
+static bool
+activate_window(size_t index)
 {
 	if (index >= window_count || index == active_window)
-		return;
+		return false;
+	previous_window = windows[active_window];
 	active_window = index;
 	windows[index]->unread = false;
 	help_visible = false;
-	render(true);
+	return true;
+}
+
+static void
+select_window(size_t index)
+{
+	if (activate_window(index))
+		render(true);
+}
+
+static bool
+activate_previous_window(void)
+{
+	ssize_t index;
+
+	if (previous_window == NULL)
+		return false;
+	index = find_window(previous_window);
+	if (index < 0) {
+		previous_window = NULL;
+		return false;
+	}
+	return activate_window((size_t)index);
+}
+
+static void
+select_previous_window(void)
+{
+	if (activate_previous_window())
+		render(true);
 }
 
 static void
@@ -2694,6 +2744,9 @@ handle_command(unsigned char byte)
 	switch (byte) {
 	case 'm':
 		new_shell();
+		break;
+	case 'o':
+		select_previous_window();
 		break;
 	case MWIN_CTRL('n'):
 		select_window((active_window + 1) % window_count);
@@ -3146,6 +3199,24 @@ self_test(void)
 	const unsigned char long_line[] = "\033[31mabcdefghij\033[0m";
 	int failed = 0;
 
+	memset(&terminal, 0, sizeof(terminal));
+	memset(&history_terminal, 0, sizeof(history_terminal));
+	windows[0] = &terminal;
+	windows[1] = &history_terminal;
+	window_count = 2;
+	active_window = 0;
+	previous_window = NULL;
+	if (!activate_window(1) || active_window != 1 || previous_window != &terminal ||
+	    !activate_previous_window() || active_window != 0 ||
+	    previous_window != &history_terminal || !activate_previous_window() ||
+	    active_window != 1 || previous_window != &terminal)
+		failed = 1;
+	previous_window = &reflow_terminal;
+	if (activate_previous_window() || previous_window != NULL)
+		failed = 1;
+	window_count = 0;
+	active_window = 0;
+	previous_window = NULL;
 	memset(&terminal, 0, sizeof(terminal));
 	if (!screen_init(&terminal.primary, 3, 8) ||
 	    !screen_init(&terminal.alternate, 3, 8)) {
