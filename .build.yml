@@ -2,7 +2,7 @@ image: alpine/edge
 secrets:
   - b566bd73-a773-48ca-be59-7b88577d83eb
 sources:
-  - git@git.sr.ht/~mapperr/mwin
+  - git@git.sr.ht:~mapperr/mwin
 environment:
   GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=no
 tasks:
