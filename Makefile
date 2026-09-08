@@ -10,23 +10,23 @@ CFLAGS = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wconversion -O2
 LDFLAGS =
 LDLIBS =
 
-all: build
+all: mwin
 
 config.h:
 	cp config.def.h config.h
 
-build: mwin.c config.h
+mwin: mwin.c config.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mwin.c $(LDLIBS)
 
 debug: CFLAGS = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wconversion -O0 -g3 -fsanitize=address,undefined
 debug: LDFLAGS = -fsanitize=address,undefined
-debug: clean build
+debug: clean mwin
 
-test: build
+test: mwin
 	./mwin --self-test
 	sh tests/integration.sh
 
-install: build
+install: mwin
 	mkdir -p "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(MANPREFIX)/man1"
 	cp mwin "$(DESTDIR)$(PREFIX)/bin/mwin"
 	chmod 755 "$(DESTDIR)$(PREFIX)/bin/mwin"
