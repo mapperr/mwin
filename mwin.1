@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.2.2" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.0" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -79,11 +79,11 @@ Move one page backward.
 .B Ctrl-d
 Move one page forward.
 .TP
-.B y
-Move one row backward.
+.B k
+Move one row upward toward older output.
 .TP
-.B e
-Move one row forward.
+.B j
+Move one row downward toward newer output.
 .TP
 .B g
 Move to the oldest retained row.
@@ -96,7 +96,10 @@ Leave scrollback and return to the live terminal.
 .PP
 Incoming output continues to be processed while scrollback is visible. Only
 rows scrolled off the primary screen are retained; alternate-screen activity
-is excluded. Historical rows are not reflowed after a resize.
+is excluded. Soft-wrapped primary-screen and historical lines are reflowed
+after a resize; hard newlines remain separate. Rows displaced by a height
+reduction enter scrollback. Reflowed rows count toward the configured history
+limit; when MWIN_SCROLLBACK is 0, content outside the live screen is discarded.
 .SH ENVIRONMENT
 .TP
 .B SHELL

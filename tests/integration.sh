@@ -72,13 +72,19 @@ echo "options: ok"
 	sleep 0.3
 	printf '\017\025'
 	sleep 0.1
-	printf '\025ye\004gG'
+	printf '\025jkg\004'
+	sleep 0.1
+	printf '\017\025G'
 	sleep 0.1
 	printf '\017\030'
 } | MWIN_SCROLLBACK=5 run_script "$tmp.scroll" './mwin'
 
 if ! grep -a 'scroll 5/5' "$tmp.scroll" >/dev/null; then
 	echo "scrollback: status not observed" >&2
+	exit 1
+fi
+if ! grep -a 'scroll 4/5' "$tmp.scroll" >/dev/null; then
+	echo "scrollback: j did not move toward newer output" >&2
 	exit 1
 fi
 

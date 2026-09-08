@@ -100,6 +100,7 @@ struct HistoryLine {
 	size_t length;
 	struct StyleSpan *spans;
 	size_t span_count;
+	bool wrapped;
 };
 
 struct History {
@@ -109,11 +110,32 @@ struct History {
 	size_t head;
 };
 
+struct ReflowBuffer {
+	struct Cell *cells;
+	unsigned char *wrapped;
+	size_t count;
+	size_t capacity;
+	int cols;
+	int col;
+	bool need_row;
+	bool have_last;
+	size_t last_row;
+	int last_col;
+	bool cursor_set;
+	size_t cursor_row;
+	int cursor_col;
+	bool cursor_wrap_pending;
+	bool saved_set;
+	size_t saved_row;
+	int saved_col;
+};
+
 struct Terminal;
 
 struct Screen {
 	struct Cell *cells;
 	unsigned char *dirty;
+	unsigned char *wrapped;
 	int rows;
 	int cols;
 	int row;
@@ -202,8 +224,11 @@ static void render(bool full);
 static void resize_all(void);
 static void remove_window(size_t index, bool terminate);
 static void normalize_row(struct Screen *screen, int row);
-static void history_push(struct Terminal *terminal, const struct Cell *cells, int columns);
+static void history_push(struct Terminal *terminal, const struct Cell *cells,
+                         int columns, bool wrapped);
 static void history_clear(struct Terminal *terminal);
+static bool decode_utf8(const char *text, size_t length, size_t *offset,
+                        uint32_t *codepoint);
 
 static struct Attr
 default_attr(void)
@@ -260,6 +285,7 @@ screen_reset(struct Screen *screen)
 	count = (size_t)screen->rows * (size_t)screen->cols;
 	for (i = 0; i < count; i++)
 		screen->cells[i] = blank;
+	memset(screen->wrapped, 0, (size_t)screen->rows);
 	mark_all_dirty(screen);
 }
 
@@ -271,9 +297,11 @@ screen_init(struct Screen *screen, int rows, int cols)
 	screen->cols = cols;
 	screen->cells = calloc((size_t)rows * (size_t)cols, sizeof(*screen->cells));
 	screen->dirty = calloc((size_t)rows, sizeof(*screen->dirty));
-	if (screen->cells == NULL || screen->dirty == NULL) {
+	screen->wrapped = calloc((size_t)rows, sizeof(*screen->wrapped));
+	if (screen->cells == NULL || screen->dirty == NULL || screen->wrapped == NULL) {
 		free(screen->cells);
 		free(screen->dirty);
+		free(screen->wrapped);
 		return false;
 	}
 	screen_reset(screen);
@@ -285,6 +313,7 @@ screen_free(struct Screen *screen)
 {
 	free(screen->cells);
 	free(screen->dirty);
+	free(screen->wrapped);
 	memset(screen, 0, sizeof(*screen));
 }
 
@@ -293,6 +322,7 @@ screen_resize(struct Screen *screen, int rows, int cols)
 {
 	struct Cell *new_cells;
 	unsigned char *new_dirty;
+	unsigned char *new_wrapped;
 	struct Cell blank = blank_cell(default_attr());
 	int copy_rows = rows < screen->rows ? rows : screen->rows;
 	int copy_cols = cols < screen->cols ? cols : screen->cols;
@@ -303,9 +333,11 @@ screen_resize(struct Screen *screen, int rows, int cols)
 		return;
 	new_cells = malloc((size_t)rows * (size_t)cols * sizeof(*new_cells));
 	new_dirty = malloc((size_t)rows);
-	if (new_cells == NULL || new_dirty == NULL) {
+	new_wrapped = calloc((size_t)rows, sizeof(*new_wrapped));
+	if (new_cells == NULL || new_dirty == NULL || new_wrapped == NULL) {
 		free(new_cells);
 		free(new_dirty);
+		free(new_wrapped);
 		return;
 	}
 	for (r = 0; r < rows; r++)
@@ -315,11 +347,14 @@ screen_resize(struct Screen *screen, int rows, int cols)
 		memcpy(&new_cells[(size_t)r * (size_t)cols],
 		       &screen->cells[(size_t)r * (size_t)screen->cols],
 		       (size_t)copy_cols * sizeof(*new_cells));
+	memcpy(new_wrapped, screen->wrapped, (size_t)copy_rows);
 	memset(new_dirty, 1, (size_t)rows);
 	free(screen->cells);
 	free(screen->dirty);
+	free(screen->wrapped);
 	screen->cells = new_cells;
 	screen->dirty = new_dirty;
+	screen->wrapped = new_wrapped;
 	screen->rows = rows;
 	screen->cols = cols;
 	if (screen->row >= rows)
@@ -360,6 +395,8 @@ blank_range(struct Screen *screen, int row, int first, int last)
 		first--;
 	if (last + 1 < screen->cols && cell_at(screen, row, last)->width == 2)
 		last++;
+	if (first == 0 && last == screen->cols - 1)
+		screen->wrapped[row] = 0;
 	for (col = first; col <= last; col++)
 		*cell_at(screen, row, col) = blank;
 	screen->dirty[row] = 1;
@@ -405,11 +442,16 @@ scroll_up(struct Screen *screen, int count, bool record)
 	if (record && screen->records_history && screen->terminal != NULL &&
 	    top == 0 && bottom == screen->rows - 1) {
 		for (row = 0; row < count; row++)
-			history_push(screen->terminal, cell_at(screen, row, 0), screen->cols);
+			history_push(screen->terminal, cell_at(screen, row, 0), screen->cols,
+			             screen->wrapped[row] != 0);
 	}
 	if (count < height)
 		memmove(cell_at(screen, top, 0), cell_at(screen, top + count, 0),
 		        (size_t)(height - count) * (size_t)screen->cols * sizeof(struct Cell));
+	if (count < height)
+		memmove(&screen->wrapped[top], &screen->wrapped[top + count],
+		        (size_t)(height - count));
+	memset(&screen->wrapped[bottom - count + 1], 0, (size_t)count);
 	for (row = bottom - count + 1; row <= bottom; row++)
 		blank_range(screen, row, 0, screen->cols - 1);
 	for (row = top; row <= bottom; row++)
@@ -431,6 +473,10 @@ scroll_down(struct Screen *screen, int count)
 	if (count < height)
 		memmove(cell_at(screen, top + count, 0), cell_at(screen, top, 0),
 		        (size_t)(height - count) * (size_t)screen->cols * sizeof(struct Cell));
+	if (count < height)
+		memmove(&screen->wrapped[top + count], &screen->wrapped[top],
+		        (size_t)(height - count));
+	memset(&screen->wrapped[top], 0, (size_t)count);
 	for (row = top; row < top + count; row++)
 		blank_range(screen, row, 0, screen->cols - 1);
 	for (row = top; row <= bottom; row++)
@@ -438,8 +484,9 @@ scroll_down(struct Screen *screen, int count)
 }
 
 static void
-screen_index(struct Screen *screen)
+screen_index(struct Screen *screen, bool soft_wrap)
 {
+	screen->wrapped[screen->row] = soft_wrap ? 1 : 0;
 	if (screen->row == screen->scroll_bottom)
 		scroll_up(screen, 1, true);
 	else if (screen->row < screen->rows - 1)
@@ -561,14 +608,14 @@ put_codepoint(struct Screen *screen, uint32_t cp)
 	if (screen->wrap_pending) {
 		if (screen->wrap) {
 			screen->col = 0;
-			screen_index(screen);
+			screen_index(screen, true);
 		}
 		screen->wrap_pending = false;
 	}
 	if (width == 2 && screen->col == screen->cols - 1) {
 		if (screen->wrap) {
 			screen->col = 0;
-			screen_index(screen);
+			screen_index(screen, true);
 		} else {
 			width = 1;
 		}
@@ -1146,7 +1193,7 @@ handle_control(struct Terminal *terminal, unsigned char byte)
 	case '\n':
 	case '\v':
 	case '\f':
-		screen_index(screen);
+		screen_index(screen, false);
 		break;
 	case '\r':
 		screen->col = 0;
@@ -1260,11 +1307,11 @@ feed_byte(struct Terminal *terminal, unsigned char byte)
 			screen->wrap_pending = false;
 			break;
 		case 'D':
-			screen_index(screen);
+			screen_index(screen, false);
 			break;
 		case 'E':
 			screen->col = 0;
-			screen_index(screen);
+			screen_index(screen, false);
 			break;
 		case 'M':
 			screen_reverse_index(screen);
@@ -1425,7 +1472,8 @@ history_line_free(struct HistoryLine *line)
 }
 
 static void
-history_push(struct Terminal *terminal, const struct Cell *cells, int columns)
+history_push(struct Terminal *terminal, const struct Cell *cells, int columns,
+             bool wrapped)
 {
 	struct History *history = &terminal->history;
 	struct HistoryLine line;
@@ -1479,6 +1527,7 @@ history_push(struct Terminal *terminal, const struct Cell *cells, int columns)
 	line.length = text.length;
 	line.spans = spans;
 	line.span_count = span_count;
+	line.wrapped = wrapped;
 	if (history->lines == NULL) {
 		history->lines = calloc(history->capacity, sizeof(*history->lines));
 		if (history->lines == NULL) {
@@ -1540,6 +1589,375 @@ history_line(const struct History *history, size_t index)
 	if (history->lines == NULL || index >= history->count)
 		return NULL;
 	return &history->lines[(history->head + index) % history->capacity];
+}
+
+static void
+reflow_buffer_free(struct ReflowBuffer *buffer)
+{
+	free(buffer->cells);
+	free(buffer->wrapped);
+	memset(buffer, 0, sizeof(*buffer));
+}
+
+static bool
+reflow_start_row(struct ReflowBuffer *buffer)
+{
+	struct Cell blank = blank_cell(default_attr());
+	size_t cells;
+	size_t i;
+
+	if (!buffer->need_row)
+		return true;
+	if (buffer->count == buffer->capacity) {
+		size_t capacity = buffer->capacity == 0 ? 64 : buffer->capacity * 2;
+		struct Cell *new_cells;
+		unsigned char *new_wrapped;
+
+		if (capacity < buffer->capacity ||
+		    capacity > SIZE_MAX / (size_t)buffer->cols / sizeof(*new_cells))
+			return false;
+		cells = capacity * (size_t)buffer->cols;
+		new_cells = malloc(cells * sizeof(*new_cells));
+		new_wrapped = malloc(capacity * sizeof(*new_wrapped));
+		if (new_cells == NULL || new_wrapped == NULL) {
+			free(new_cells);
+			free(new_wrapped);
+			return false;
+		}
+		if (buffer->count != 0) {
+			memcpy(new_cells, buffer->cells,
+			       buffer->count * (size_t)buffer->cols * sizeof(*new_cells));
+			memcpy(new_wrapped, buffer->wrapped,
+			       buffer->count * sizeof(*new_wrapped));
+		}
+		free(buffer->cells);
+		free(buffer->wrapped);
+		buffer->cells = new_cells;
+		buffer->wrapped = new_wrapped;
+		buffer->capacity = capacity;
+	}
+	cells = buffer->count * (size_t)buffer->cols;
+	for (i = 0; i < (size_t)buffer->cols; i++)
+		buffer->cells[cells + i] = blank;
+	buffer->wrapped[buffer->count] = 0;
+	buffer->count++;
+	buffer->col = 0;
+	buffer->need_row = false;
+	return true;
+}
+
+static bool
+reflow_wrap_row(struct ReflowBuffer *buffer)
+{
+	if (!reflow_start_row(buffer))
+		return false;
+	buffer->wrapped[buffer->count - 1] = 1;
+	buffer->need_row = true;
+	return reflow_start_row(buffer);
+}
+
+static bool
+reflow_put_cell(struct ReflowBuffer *buffer, const struct Cell *source)
+{
+	struct Cell *cell;
+	int width = source->width == 2 ? 2 : 1;
+
+	if (!reflow_start_row(buffer))
+		return false;
+	if (buffer->col >= buffer->cols || buffer->col + width > buffer->cols)
+		if (!reflow_wrap_row(buffer))
+			return false;
+	cell = &buffer->cells[(buffer->count - 1) * (size_t)buffer->cols +
+	                      (size_t)buffer->col];
+	*cell = *source;
+	cell->width = (unsigned char)width;
+	buffer->last_row = buffer->count - 1;
+	buffer->last_col = buffer->col;
+	buffer->have_last = true;
+	if (width == 2) {
+		struct Cell *next = cell + 1;
+		memset(next, 0, sizeof(*next));
+		next->width = 0;
+		next->attr = cell->attr;
+	}
+	buffer->col += width;
+	return true;
+}
+
+static void
+reflow_add_combining(struct ReflowBuffer *buffer, uint32_t cp)
+{
+	struct Cell *cell;
+
+	if (!buffer->have_last)
+		return;
+	cell = &buffer->cells[buffer->last_row * (size_t)buffer->cols +
+	                      (size_t)buffer->last_col];
+	if (cell->ncombining < COMBINING_MAX)
+		cell->combining[cell->ncombining++] = cp;
+}
+
+static bool
+reflow_hard_break(struct ReflowBuffer *buffer)
+{
+	if (!reflow_start_row(buffer))
+		return false;
+	buffer->wrapped[buffer->count - 1] = 0;
+	buffer->need_row = true;
+	buffer->have_last = false;
+	return true;
+}
+
+static bool
+reflow_mark_position(struct ReflowBuffer *buffer, bool wrap_pending,
+                     size_t *row, int *col, bool *new_wrap_pending)
+{
+	if (!reflow_start_row(buffer))
+		return false;
+	if (buffer->col >= buffer->cols) {
+		if (wrap_pending) {
+			*row = buffer->count - 1;
+			*col = buffer->cols - 1;
+			*new_wrap_pending = true;
+			return true;
+		}
+		if (!reflow_wrap_row(buffer))
+			return false;
+	}
+	*row = buffer->count - 1;
+	*col = buffer->col;
+	*new_wrap_pending = false;
+	return true;
+}
+
+static bool
+reflow_feed_history(struct ReflowBuffer *buffer, const struct HistoryLine *line)
+{
+	struct Attr attr = default_attr();
+	size_t offset = 0;
+	size_t span = 0;
+	int column = 0;
+
+	while (offset < line->length) {
+		struct Cell cell;
+		uint32_t cp;
+		int width;
+
+		if (!decode_utf8(line->text, line->length, &offset, &cp))
+			break;
+		width = wcwidth((wchar_t)cp);
+		if (width == 0) {
+			reflow_add_combining(buffer, cp);
+			continue;
+		}
+		if (width < 0 || width > 2)
+			width = 1;
+		while (span < line->span_count &&
+		       line->spans[span].column <= column) {
+			attr = line->spans[span].attr;
+			span++;
+		}
+		memset(&cell, 0, sizeof(cell));
+		cell.cp = cp;
+		cell.width = (unsigned char)width;
+		cell.attr = attr;
+		if (!reflow_put_cell(buffer, &cell))
+			return false;
+		column += width;
+	}
+	return line->wrapped || reflow_hard_break(buffer);
+}
+
+static int
+screen_row_last(const struct Screen *screen, int row)
+{
+	int col;
+	int last = 0;
+
+	for (col = 0; col < screen->cols; col++) {
+		const struct Cell *cell = &screen->cells[(size_t)row *
+		                                                (size_t)screen->cols +
+		                                                (size_t)col];
+		if (cell->width != 0 && !cell_is_empty(cell))
+			last = col + cell->width;
+	}
+	return last;
+}
+
+static bool
+reflow_feed_screen_row(struct ReflowBuffer *buffer, const struct Screen *screen,
+                       int row)
+{
+	int cursor_mark = -1;
+	int saved_mark = -1;
+	int used = screen_row_last(screen, row);
+	int col = 0;
+
+	if (row == screen->row) {
+		cursor_mark = screen->col + (screen->wrap_pending ? 1 : 0);
+		if (cursor_mark < screen->cols && cursor_mark > 0 &&
+		    screen->cells[(size_t)row * (size_t)screen->cols +
+		                  (size_t)cursor_mark].width == 0)
+			cursor_mark--;
+		if (cursor_mark > used)
+			used = cursor_mark;
+	}
+	if (row == screen->saved_row) {
+		saved_mark = screen->saved_col;
+		if (saved_mark > 0 &&
+		    screen->cells[(size_t)row * (size_t)screen->cols +
+		                  (size_t)saved_mark].width == 0)
+			saved_mark--;
+		if (saved_mark > used)
+			used = saved_mark;
+	}
+	while (col < used) {
+		const struct Cell *cell;
+		int width;
+
+		if (col == cursor_mark) {
+			if (!reflow_mark_position(buffer, screen->wrap_pending,
+			                          &buffer->cursor_row, &buffer->cursor_col,
+			                          &buffer->cursor_wrap_pending))
+				return false;
+			buffer->cursor_set = true;
+		}
+		if (col == saved_mark) {
+			bool ignored;
+			if (!reflow_mark_position(buffer, false, &buffer->saved_row,
+			                          &buffer->saved_col, &ignored))
+				return false;
+			buffer->saved_set = true;
+		}
+		cell = &screen->cells[(size_t)row * (size_t)screen->cols +
+		                      (size_t)col];
+		if (cell->width == 0) {
+			col++;
+			continue;
+		}
+		width = cell->width == 2 ? 2 : 1;
+		if (!reflow_put_cell(buffer, cell))
+			return false;
+		col += width;
+	}
+	if (cursor_mark == used) {
+		if (!reflow_mark_position(buffer, screen->wrap_pending,
+		                          &buffer->cursor_row, &buffer->cursor_col,
+		                          &buffer->cursor_wrap_pending))
+			return false;
+		buffer->cursor_set = true;
+	}
+	if (saved_mark == used) {
+		bool ignored;
+		if (!reflow_mark_position(buffer, false, &buffer->saved_row,
+		                          &buffer->saved_col, &ignored))
+			return false;
+		buffer->saved_set = true;
+	}
+	return screen->wrapped[row] != 0 || reflow_hard_break(buffer);
+}
+
+static bool
+reflow_primary(struct Terminal *terminal, int rows, int cols)
+{
+	struct Screen *screen = &terminal->primary;
+	struct ReflowBuffer buffer;
+	struct Cell *new_cells;
+	struct Cell *old_cells;
+	unsigned char *new_dirty;
+	unsigned char *new_wrapped;
+	unsigned char *old_dirty;
+	unsigned char *old_wrapped;
+	struct Cell blank = blank_cell(default_attr());
+	bool was_scrolling = terminal->scrolling;
+	size_t old_scroll_offset = terminal->scroll_offset;
+	size_t start;
+	size_t i;
+	int r;
+	int c;
+
+	if (rows == screen->rows && cols == screen->cols)
+		return true;
+	memset(&buffer, 0, sizeof(buffer));
+	buffer.cols = cols;
+	buffer.need_row = true;
+	for (i = 0; i < terminal->history.count; i++)
+		if (!reflow_feed_history(&buffer, history_line(&terminal->history, i)))
+			goto fail;
+	for (r = 0; r < screen->rows; r++)
+		if (!reflow_feed_screen_row(&buffer, screen, r))
+			goto fail;
+	if (!buffer.cursor_set || !buffer.saved_set || buffer.count == 0)
+		goto fail;
+	start = buffer.count > (size_t)rows ? buffer.count - (size_t)rows : 0;
+	if (buffer.cursor_row < start)
+		start = buffer.cursor_row;
+	else if (buffer.cursor_row >= start + (size_t)rows)
+		start = buffer.cursor_row - (size_t)rows + 1;
+	if ((size_t)rows > SIZE_MAX / (size_t)cols ||
+	    (size_t)rows * (size_t)cols > SIZE_MAX / sizeof(*new_cells))
+		goto fail;
+	new_cells = malloc((size_t)rows * (size_t)cols * sizeof(*new_cells));
+	new_dirty = malloc((size_t)rows);
+	new_wrapped = calloc((size_t)rows, sizeof(*new_wrapped));
+	if (new_cells == NULL || new_dirty == NULL || new_wrapped == NULL) {
+		free(new_cells);
+		free(new_dirty);
+		free(new_wrapped);
+		goto fail;
+	}
+	for (r = 0; r < rows; r++)
+		for (c = 0; c < cols; c++)
+			new_cells[(size_t)r * (size_t)cols + (size_t)c] = blank;
+	for (r = 0; r < rows && start + (size_t)r < buffer.count; r++) {
+		memcpy(&new_cells[(size_t)r * (size_t)cols],
+		       &buffer.cells[(start + (size_t)r) * (size_t)cols],
+		       (size_t)cols * sizeof(*new_cells));
+		new_wrapped[r] = buffer.wrapped[start + (size_t)r];
+	}
+	memset(new_dirty, 1, (size_t)rows);
+	old_cells = screen->cells;
+	old_dirty = screen->dirty;
+	old_wrapped = screen->wrapped;
+	screen->cells = new_cells;
+	screen->dirty = new_dirty;
+	screen->wrapped = new_wrapped;
+	screen->rows = rows;
+	screen->cols = cols;
+	screen->row = (int)(buffer.cursor_row - start);
+	screen->col = buffer.cursor_col;
+	screen->wrap_pending = buffer.cursor_wrap_pending;
+	if (buffer.saved_row < start) {
+		screen->saved_row = 0;
+		screen->saved_col = 0;
+	} else if (buffer.saved_row >= start + (size_t)rows) {
+		screen->saved_row = rows - 1;
+		screen->saved_col = cols - 1;
+	} else {
+		screen->saved_row = (int)(buffer.saved_row - start);
+		screen->saved_col = buffer.saved_col;
+	}
+	screen->scroll_top = 0;
+	screen->scroll_bottom = rows - 1;
+	terminal->scrolling = false;
+	history_clear(terminal);
+	for (i = 0; i < start; i++)
+		history_push(terminal, &buffer.cells[i * (size_t)cols], cols,
+		             buffer.wrapped[i] != 0);
+	terminal->scrolling = was_scrolling && terminal->history.count != 0;
+	terminal->scroll_offset = terminal->scrolling ?
+	                          (old_scroll_offset < terminal->history.count ?
+	                           old_scroll_offset : terminal->history.count) : 0;
+	terminal->viewport_dirty = true;
+	free(old_cells);
+	free(old_dirty);
+	free(old_wrapped);
+	reflow_buffer_free(&buffer);
+	return true;
+
+fail:
+	reflow_buffer_free(&buffer);
+	return false;
 }
 
 static void
@@ -1761,7 +2179,7 @@ append_status(struct Buffer *output)
 		const char *title = windows[active_window]->title[0] == '\0' ?
 		                    "shell" : windows[active_window]->title;
 		int written = snprintf(status, sizeof(status),
-		                       "[%zu:%s] scroll %zu/%zu  ^U/^D page  y/e line  g/G oldest/live  Esc exit",
+		                       "[%zu:%s] scroll %zu/%zu  ^U/^D page  k/j line  g/G oldest/live  Esc exit",
 		                       active_window + 1, title,
 		                       windows[active_window]->scroll_offset,
 		                       windows[active_window]->history.count);
@@ -2244,10 +2662,10 @@ handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
 	case MWIN_CTRL('d'):
 		scroll_forward(terminal, scroll_page(terminal));
 		break;
-	case 'y':
+	case 'k':
 		scroll_backward(terminal, 1);
 		break;
-	case 'e':
+	case 'j':
 		scroll_forward(terminal, 1);
 		break;
 	case 'g':
@@ -2490,7 +2908,8 @@ resize_all(void)
 	size.ws_xpixel = 0;
 	size.ws_ypixel = 0;
 	for (i = 0; i < window_count; i++) {
-		screen_resize(&windows[i]->primary, rows, cols);
+		if (!reflow_primary(windows[i], rows, cols))
+			screen_resize(&windows[i]->primary, rows, cols);
 		screen_resize(&windows[i]->alternate, rows, cols);
 		(void)ioctl(windows[i]->fd, TIOCSWINSZ, &size);
 	}
@@ -2713,6 +3132,7 @@ self_test(void)
 {
 	struct Terminal terminal;
 	struct Terminal history_terminal;
+	struct Terminal reflow_terminal;
 	struct Screen *screen;
 	const struct HistoryLine *line;
 	const unsigned char basic[] = "abc\033[2;2HZ\033[31mR\033[0m";
@@ -2723,6 +3143,7 @@ self_test(void)
 	const unsigned char scrolling[] = "a\r\n\033[31mb\033[0m\r\nc\r\nd\r\n";
 	const unsigned char alternate_scrolling[] = "\033[?1049h1\r\n2\r\n3\r\n\033[?1049l";
 	const unsigned char clear_history[] = "\033[3J";
+	const unsigned char long_line[] = "\033[31mabcdefghij\033[0m";
 	int failed = 0;
 
 	memset(&terminal, 0, sizeof(terminal));
@@ -2806,6 +3227,64 @@ self_test(void)
 	history_free(&history_terminal);
 	screen_free(&history_terminal.primary);
 	screen_free(&history_terminal.alternate);
+	memset(&reflow_terminal, 0, sizeof(reflow_terminal));
+	reflow_terminal.history.capacity = 16;
+	if (!screen_init(&reflow_terminal.primary, 3, 6) ||
+	    !screen_init(&reflow_terminal.alternate, 3, 6)) {
+		fprintf(stderr, "self-test: reflow allocation failed\n");
+		return 1;
+	}
+	reflow_terminal.primary.records_history = true;
+	reflow_terminal.primary.terminal = &reflow_terminal;
+	reflow_terminal.alternate.terminal = &reflow_terminal;
+	reflow_terminal.screen = &reflow_terminal.primary;
+	reflow_terminal.parser.state = P_GROUND;
+	feed_bytes(&reflow_terminal, long_line, sizeof(long_line) - 1);
+	if (reflow_terminal.primary.wrapped[0] == 0 ||
+	    !reflow_primary(&reflow_terminal, 3, 4))
+		failed = 1;
+	line = history_line(&reflow_terminal.history, 0);
+	if (reflow_terminal.history.count != 1 || line == NULL || !line->wrapped ||
+	    line->length != 4 || memcmp(line->text, "abcd", 4) != 0 ||
+	    line->span_count != 1 || line->spans[0].attr.fg != 1 ||
+	    cell_at(&reflow_terminal.primary, 0, 0)->cp != 'e' ||
+	    cell_at(&reflow_terminal.primary, 0, 3)->cp != 'h' ||
+	    reflow_terminal.primary.wrapped[0] == 0 ||
+	    cell_at(&reflow_terminal.primary, 1, 0)->cp != 'i' ||
+	    cell_at(&reflow_terminal.primary, 1, 1)->cp != 'j' ||
+	    reflow_terminal.primary.row != 1 || reflow_terminal.primary.col != 2)
+		failed = 1;
+	if (!reflow_primary(&reflow_terminal, 3, 6) ||
+	    reflow_terminal.history.count != 0 ||
+	    cell_at(&reflow_terminal.primary, 0, 0)->cp != 'a' ||
+	    cell_at(&reflow_terminal.primary, 0, 0)->attr.fg != 1 ||
+	    cell_at(&reflow_terminal.primary, 0, 5)->cp != 'f' ||
+	    reflow_terminal.primary.wrapped[0] == 0 ||
+	    cell_at(&reflow_terminal.primary, 1, 0)->cp != 'g' ||
+	    cell_at(&reflow_terminal.primary, 1, 3)->cp != 'j' ||
+	    reflow_terminal.primary.row != 1 || reflow_terminal.primary.col != 4)
+		failed = 1;
+	terminal_reset(&reflow_terminal);
+	feed_bytes(&reflow_terminal, (const unsigned char *)"one\r\ntwo\r\nthree", 15);
+	if (!reflow_primary(&reflow_terminal, 2, 6))
+		failed = 1;
+	line = history_line(&reflow_terminal.history, 0);
+	if (reflow_terminal.history.count != 1 || line == NULL || line->wrapped ||
+	    line->length != 3 || memcmp(line->text, "one", 3) != 0 ||
+	    cell_at(&reflow_terminal.primary, 0, 0)->cp != 't' ||
+	    cell_at(&reflow_terminal.primary, 1, 0)->cp != 't' ||
+	    reflow_terminal.primary.row != 1 || reflow_terminal.primary.col != 5)
+		failed = 1;
+	if (!reflow_primary(&reflow_terminal, 3, 6) ||
+	    reflow_terminal.history.count != 0 ||
+	    cell_at(&reflow_terminal.primary, 0, 0)->cp != 'o' ||
+	    cell_at(&reflow_terminal.primary, 1, 0)->cp != 't' ||
+	    cell_at(&reflow_terminal.primary, 2, 0)->cp != 't' ||
+	    reflow_terminal.primary.row != 2 || reflow_terminal.primary.col != 5)
+		failed = 1;
+	history_free(&reflow_terminal);
+	screen_free(&reflow_terminal.primary);
+	screen_free(&reflow_terminal.alternate);
 	if (failed) {
 		fprintf(stderr, "self-test: failed\n");
 		return 1;

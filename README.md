@@ -108,8 +108,8 @@ Each window has an independent in-memory history. While browsing it:
 | --- | --- |
 | `Ctrl-u` | one page backward |
 | `Ctrl-d` | one page forward |
-| `y` | one row backward |
-| `e` | one row forward |
+| `k` | one row upward/older |
+| `j` | one row downward/newer |
 | `g` | oldest retained row |
 | `G` | live terminal |
 | `Esc` | leave scrollback and return to the live terminal |
@@ -117,8 +117,12 @@ Each window has an independent in-memory history. While browsing it:
 New output continues to be parsed while browsing and the visible position
 remains anchored. The history records only rows that leave the top of the
 primary screen; alternate-screen redraws from editors and pagers do not fill
-it. Old rows keep their original layout after a resize and are clipped or
-padded instead of being reflowed.
+it. Soft-wrapped primary-screen and historical lines are reflowed when the
+hosting terminal is resized. Hard newlines remain separate, cursor position is
+preserved, and rows displaced by a height reduction move into scrollback.
+Reflowed rows count toward the configured history limit; with
+`MWIN_SCROLLBACK=0`, content that no longer fits on the live screen cannot be
+retained.
 
 Rows are stored compactly as UTF-8 plus style changes. They are allocated only
 as output scrolls. The only limit is the number of rows:
@@ -151,7 +155,6 @@ modes, and cursor reports.
 It deliberately does not provide:
 
 - scrollback search, text selection, or copy mode;
-- reflow of historical rows after resize;
 - window names edited by mwin (OSC titles are displayed automatically);
 - multiple attached clients controlled by mwin itself;
 - passthrough for OSC 8 hyperlinks, OSC 52 clipboard access, sixel, kitty
@@ -167,6 +170,7 @@ closing the outer terminal without adding a daemon or socket protocol to mwin.
 make test
 ```
 
-The self-test exercises the VT model, compact history, styles, and ring-buffer
-eviction. Integration tests run mwin under a real pseudo-terminal and exercise
-window commands, alternate prefixes, scrollback navigation, and clean shutdown.
+The self-test exercises the VT model, resize reflow, compact history, styles,
+and ring-buffer eviction. Integration tests run mwin under a real
+pseudo-terminal and exercise window commands, alternate prefixes, scrollback
+navigation, and clean shutdown.
