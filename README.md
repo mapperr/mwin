@@ -129,6 +129,12 @@ Reflowed rows count toward the configured history limit; with
 `MWIN_SCROLLBACK=0`, content that no longer fits on the live screen cannot be
 retained.
 
+Mwin reproduces soft-wrapped boundaries as real autowraps in the hosting
+terminal. Consequently, selecting a wrapped logical line with foot's
+`Ctrl-Shift-c` (or the equivalent shortcut in another terminal) copies it
+without inserting a newline at the visual wrap point. Explicit newlines remain
+newlines.
+
 Rows are stored compactly as UTF-8 plus style changes. They are allocated only
 as output scrolls. The only limit is the number of rows:
 
@@ -176,6 +182,6 @@ make test
 ```
 
 The self-test exercises the VT model, resize reflow, compact history, styles,
-and ring-buffer eviction. Integration tests run mwin under a real
-pseudo-terminal and exercise window commands, alternate prefixes, scrollback
-navigation, and clean shutdown.
+ring-buffer eviction, and preservation of soft-wrap boundaries in rendered
+output. Integration tests run mwin under a real pseudo-terminal and exercise
+window commands, alternate prefixes, scrollback navigation, and clean shutdown.

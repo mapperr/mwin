@@ -487,7 +487,11 @@ scroll_down(struct Screen *screen, int count)
 static void
 screen_index(struct Screen *screen, bool soft_wrap)
 {
-	screen->wrapped[screen->row] = soft_wrap ? 1 : 0;
+	unsigned char wrapped = soft_wrap ? 1 : 0;
+
+	if (screen->wrapped[screen->row] != wrapped)
+		screen->dirty[screen->row] = 1;
+	screen->wrapped[screen->row] = wrapped;
 	if (screen->row == screen->scroll_bottom)
 		scroll_up(screen, 1, true);
 	else if (screen->row < screen->rows - 1)
@@ -1394,6 +1398,22 @@ output_append(struct Buffer *output, const char *text)
 }
 
 static bool
+buffer_contains(const struct Buffer *buffer, const char *text)
+{
+	size_t length = strlen(text);
+	size_t offset;
+
+	if (length == 0)
+		return true;
+	if (length > buffer->length)
+		return false;
+	for (offset = 0; offset <= buffer->length - length; offset++)
+		if (memcmp(buffer->data + offset, text, length) == 0)
+			return true;
+	return false;
+}
+
+static bool
 output_printf(struct Buffer *output, const char *format, ...)
 {
 	va_list arguments;
@@ -2001,27 +2021,24 @@ append_attr(struct Buffer *output, struct Attr attr)
 }
 
 static void
-append_screen_row(struct Buffer *output, struct Screen *screen, int source_row,
-                  int display_row)
+append_screen_cells(struct Buffer *output, struct Screen *screen, int source_row,
+                    struct Attr *previous)
 {
-	struct Attr previous = {0, 0, UINT32_MAX};
 	int col;
 
-	(void)output_printf(output, "\033[%d;1H", display_row + 1);
 	for (col = 0; col < screen->cols; col++) {
 		struct Cell *cell = cell_at(screen, source_row, col);
 		unsigned int i;
 		if (cell->width == 0)
 			continue;
-		if (!attr_equal(previous, cell->attr)) {
+		if (!attr_equal(*previous, cell->attr)) {
 			append_attr(output, cell->attr);
-			previous = cell->attr;
+			*previous = cell->attr;
 		}
 		append_codepoint(output, cell->cp == 0 ? ' ' : cell->cp);
 		for (i = 0; i < cell->ncombining; i++)
 			append_codepoint(output, cell->combining[i]);
 	}
-	(void)output_append(output, "\033[0m");
 }
 
 static bool
@@ -2075,16 +2092,14 @@ decode_utf8(const char *text, size_t length, size_t *offset, uint32_t *codepoint
 }
 
 static void
-append_history_row(struct Buffer *output, const struct HistoryLine *line,
-                   int display_row, int columns)
+append_history_cells(struct Buffer *output, const struct HistoryLine *line,
+                     int columns, struct Attr *previous)
 {
 	struct Attr current = default_attr();
 	size_t offset = 0;
 	size_t span = 0;
 	int column = 0;
 
-	(void)output_printf(output, "\033[%d;1H", display_row + 1);
-	append_attr(output, current);
 	if (line != NULL) {
 		while (offset < line->length && column < columns) {
 			size_t start = offset;
@@ -2099,44 +2114,101 @@ append_history_row(struct Buffer *output, const struct HistoryLine *line,
 				while (span < line->span_count &&
 				       line->spans[span].column <= column) {
 					current = line->spans[span].attr;
-					append_attr(output, current);
 					span++;
 				}
 			if (width > 0 && column + width > columns)
 				break;
+			if (!attr_equal(*previous, current)) {
+				append_attr(output, current);
+				*previous = current;
+			}
 			(void)buffer_append(output, line->text + start, offset - start);
 			column += width;
 		}
 	}
-	if (!attr_equal(current, default_attr()))
-		append_attr(output, default_attr());
+	current = default_attr();
+	if (column < columns && !attr_equal(*previous, current)) {
+		append_attr(output, current);
+		*previous = current;
+	}
 	while (column < columns) {
 		(void)buffer_append(output, " ", 1);
 		column++;
 	}
+}
+
+static const struct HistoryLine *
+viewport_history_line(struct Terminal *terminal, size_t first, int display_row,
+                      int *screen_row)
+{
+	struct Screen *screen = terminal->screen;
+	size_t line = first + (size_t)display_row;
+
+	*screen_row = -1;
+	if (line < terminal->history.count)
+		return history_line(&terminal->history, line);
+	line -= terminal->history.count;
+	if (line < (size_t)screen->rows)
+		*screen_row = (int)line;
+	return NULL;
+}
+
+static bool
+viewport_row_wrapped(struct Terminal *terminal, size_t first, int display_row)
+{
+	int screen_row;
+	const struct HistoryLine *line = viewport_history_line(terminal, first,
+	                                                     display_row, &screen_row);
+
+	if (screen_row >= 0)
+		return terminal->screen->wrapped[screen_row] != 0;
+	return line != NULL && line->wrapped;
+}
+
+static void
+append_screen_rows(struct Buffer *output, struct Screen *screen, int first,
+                   int last)
+{
+	struct Attr previous = {0, 0, UINT32_MAX};
+	int row;
+
+	(void)output_printf(output, "\033[%d;1H", first + 1);
+	for (row = first; row <= last; row++) {
+		append_screen_cells(output, screen, row, &previous);
+		if (row < last && screen->wrapped[row] == 0)
+			(void)output_append(output, "\r\n");
+	}
 	(void)output_append(output, "\033[0m");
+	if (last + 1 < host_rows && screen->wrapped[last] == 0)
+		(void)output_append(output, "\r\n");
 }
 
 static void
 append_viewport(struct Buffer *output, struct Terminal *terminal)
 {
 	struct Screen *screen = terminal->screen;
+	struct Attr previous = {0, 0, UINT32_MAX};
 	size_t first = terminal->history.count - terminal->scroll_offset;
 	int display_row;
 
+	(void)output_append(output, "\033[1;1H");
 	for (display_row = 0; display_row < screen->rows; display_row++) {
-		size_t line = first + (size_t)display_row;
-		if (line < terminal->history.count) {
-			append_history_row(output, history_line(&terminal->history, line),
-			                   display_row, screen->cols);
-		} else {
-			size_t source = line - terminal->history.count;
-			if (source < (size_t)screen->rows)
-				append_screen_row(output, screen, (int)source, display_row);
-			else
-				append_history_row(output, NULL, display_row, screen->cols);
-		}
+		int screen_row;
+		const struct HistoryLine *line = viewport_history_line(terminal, first,
+		                                                        display_row,
+		                                                        &screen_row);
+		if (screen_row >= 0)
+			append_screen_cells(output, screen, screen_row, &previous);
+		else
+			append_history_cells(output, line, screen->cols, &previous);
+		if (display_row + 1 < screen->rows &&
+		    !viewport_row_wrapped(terminal, first, display_row))
+			(void)output_append(output, "\r\n");
 	}
+	(void)output_append(output, "\033[0m");
+	if (screen->rows < host_rows &&
+	    !viewport_row_wrapped(terminal, first, screen->rows - 1))
+		(void)output_append(output, "\r\n");
 }
 
 static const char *
@@ -2312,11 +2384,25 @@ render(bool full)
 			terminal->viewport_dirty = false;
 		}
 	} else {
-		for (row = 0; row < screen->rows; row++) {
-			if (screen->dirty[row]) {
-				append_screen_row(&output, screen, row, row);
-				screen->dirty[row] = 0;
+		for (row = 0; row < screen->rows;) {
+			int first;
+			int last;
+			int current;
+
+			if (!screen->dirty[row]) {
+				row++;
+				continue;
 			}
+			first = row;
+			while (first > 0 && screen->wrapped[first - 1] != 0)
+				first--;
+			last = row;
+			while (last + 1 < screen->rows && screen->wrapped[last] != 0)
+				last++;
+			append_screen_rows(&output, screen, first, last);
+			for (current = first; current <= last; current++)
+				screen->dirty[current] = 0;
+			row = last + 1;
 		}
 	}
 	append_status(&output);
@@ -2358,8 +2444,8 @@ enter_terminal(void)
 		fatal("tcsetattr");
 	terminal_is_raw = true;
 	write_all(STDOUT_FILENO,
-	          (const unsigned char *)"\033[?1049h\033[?25l\033[0m\033[H\033[2J",
-	          strlen("\033[?1049h\033[?25l\033[0m\033[H\033[2J"));
+	          (const unsigned char *)"\033[?1049h\033[?7h\033[?25l\033[0m\033[H\033[2J",
+	          strlen("\033[?1049h\033[?7h\033[?25l\033[0m\033[H\033[2J"));
 }
 
 static void
@@ -3183,6 +3269,7 @@ scrollback_from_environment(void)
 static int
 self_test(void)
 {
+	struct Buffer render_output = {0};
 	struct Terminal terminal;
 	struct Terminal history_terminal;
 	struct Terminal reflow_terminal;
@@ -3325,6 +3412,20 @@ self_test(void)
 	    cell_at(&reflow_terminal.primary, 1, 1)->cp != 'j' ||
 	    reflow_terminal.primary.row != 1 || reflow_terminal.primary.col != 2)
 		failed = 1;
+	append_screen_rows(&render_output, &reflow_terminal.primary, 0, 1);
+	if (!buffer_contains(&render_output, "efghij") ||
+	    buffer_contains(&render_output, "\033[2;1H"))
+		failed = 1;
+	buffer_free(&render_output);
+	reflow_terminal.scrolling = true;
+	reflow_terminal.scroll_offset = 1;
+	append_viewport(&render_output, &reflow_terminal);
+	if (!buffer_contains(&render_output, "abcdefghij") ||
+	    buffer_contains(&render_output, "\033[2;1H"))
+		failed = 1;
+	buffer_free(&render_output);
+	reflow_terminal.scrolling = false;
+	reflow_terminal.scroll_offset = 0;
 	if (!reflow_primary(&reflow_terminal, 3, 6) ||
 	    reflow_terminal.history.count != 0 ||
 	    cell_at(&reflow_terminal.primary, 0, 0)->cp != 'a' ||
@@ -3346,6 +3447,14 @@ self_test(void)
 	    cell_at(&reflow_terminal.primary, 1, 0)->cp != 't' ||
 	    reflow_terminal.primary.row != 1 || reflow_terminal.primary.col != 5)
 		failed = 1;
+	reflow_terminal.scrolling = true;
+	reflow_terminal.scroll_offset = 1;
+	append_viewport(&render_output, &reflow_terminal);
+	if (!buffer_contains(&render_output, "one   \r\ntwo"))
+		failed = 1;
+	buffer_free(&render_output);
+	reflow_terminal.scrolling = false;
+	reflow_terminal.scroll_offset = 0;
 	if (!reflow_primary(&reflow_terminal, 3, 6) ||
 	    reflow_terminal.history.count != 0 ||
 	    cell_at(&reflow_terminal.primary, 0, 0)->cp != 'o' ||
