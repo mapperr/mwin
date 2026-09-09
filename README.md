@@ -181,7 +181,17 @@ closing the outer terminal without adding a daemon or socket protocol to mwin.
 make test
 ```
 
-The self-test exercises the VT model, resize reflow, compact history, styles,
-ring-buffer eviction, and preservation of soft-wrap boundaries in rendered
-output. Integration tests run mwin under a real pseudo-terminal and exercise
-window commands, alternate prefixes, scrollback navigation, and clean shutdown.
+Python 3 is required only for the integration tests, not to build or run mwin.
+The tests drive the real executable through a pseudo-terminal and reconstruct
+the visible host screen. They exercise every documented key, alternate
+prefixes, exact child dimensions and environment, input forwarding, scrollback,
+resize reflow, soft-wrap copy semantics, alternate-screen isolation, process
+groups, and clean terminal restoration. Internal self-tests cover compact
+history and representative VT parsing details that are difficult to observe at
+the user interface.
+
+An optional coverage report can be produced when `gcov` is installed:
+
+```sh
+make coverage
+```

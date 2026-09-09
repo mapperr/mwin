@@ -1,10 +1,11 @@
 .POSIX:
 
-VERSION = 0.3.2
+VERSION = 0.3.3
 PREFIX = /usr/local
 MANPREFIX = $(PREFIX)/share/man
 
 CC = cc
+PYTHON = python3
 CPPFLAGS = -DVERSION=\"$(VERSION)\"
 CFLAGS = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wconversion -O2
 LDFLAGS =
@@ -24,7 +25,13 @@ debug: clean mwin
 
 test: mwin
 	./mwin --self-test
-	sh tests/integration.sh
+	$(PYTHON) tests/integration.py
+
+coverage: clean
+	$(MAKE) CFLAGS='$(CFLAGS) -O0 --coverage' LDFLAGS='$(LDFLAGS) --coverage' mwin
+	./mwin --self-test
+	$(PYTHON) tests/integration.py
+	gcov -b -c mwin.c
 
 install: mwin
 	mkdir -p "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(MANPREFIX)/man1"
@@ -37,6 +44,6 @@ uninstall:
 	rm -f "$(DESTDIR)$(PREFIX)/bin/mwin" "$(DESTDIR)$(MANPREFIX)/man1/mwin.1"
 
 clean:
-	rm -f mwin
+	rm -f mwin *.gcda *.gcno *.gcov
 
-.PHONY: all debug test install uninstall clean
+.PHONY: all debug test coverage install uninstall clean
