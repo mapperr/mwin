@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.3.4" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.5" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -94,6 +94,10 @@ Return to the live terminal.
 .TP
 .B Escape
 Leave scrollback and return to the live terminal.
+.PP
+Prefixed window commands remain available while browsing. The scrollback
+position is retained independently when switching away from a window and is
+restored when returning to it.
 .PP
 Incoming output continues to be processed while scrollback is visible. Only
 rows scrolled off the primary screen are retained; alternate-screen activity

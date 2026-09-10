@@ -2721,10 +2721,6 @@ handle_regular_input(unsigned char byte)
 		render(true);
 		return;
 	}
-	if (windows[active_window]->scroll_offset != 0) {
-		handle_scrollback_key(windows[active_window], byte);
-		return;
-	}
 	if (prefix_pending) {
 		prefix_pending = false;
 		handle_command(byte);
@@ -2734,6 +2730,8 @@ handle_regular_input(unsigned char byte)
 		prefix_pending = true;
 		if (status_enabled)
 			render(false);
+	} else if (windows[active_window]->scroll_offset != 0) {
+		handle_scrollback_key(windows[active_window], byte);
 	} else {
 		(void)buffer_append(&windows[active_window]->input, &byte, 1);
 	}

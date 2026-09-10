@@ -119,6 +119,10 @@ Each window has an independent in-memory history. While browsing it:
 | `G` | live terminal |
 | `Esc` | leave scrollback and return to the live terminal |
 
+Window commands remain available with the usual prefix while browsing. The
+scrollback position belongs to the window, so switching away and back restores
+the same view.
+
 New output continues to be parsed while browsing and the visible position
 remains anchored. The history records only rows that leave the top of the
 primary screen; alternate-screen redraws from editors and pagers do not fill

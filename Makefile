@@ -1,6 +1,6 @@
 .POSIX:
 
-VERSION = 0.3.4
+VERSION = 0.3.5
 PREFIX = /usr/local
 MANPREFIX = $(PREFIX)/share/man
 

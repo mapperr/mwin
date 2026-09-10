@@ -501,6 +501,23 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.send(b"x")
             session.wait_status("[1:HEX-78]")
 
+    def test_window_switch_preserves_scrollback_position(self):
+        environment = {"MWIN_SCROLLBACK": "20", "SHELL": "/bin/sh"}
+        with self.probe("lines", rows=6, columns=60,
+                        environment=environment) as session:
+            session.wait_text("LIVE")
+            session.command(b"\x15")
+            session.wait_status("scroll 4/8")
+            expected = session.screen.lines(0, 4)
+
+            session.send(CTRL_O)
+            session.wait_status("prefix ^O: waiting for key")
+            session.send(b"m")
+            session.wait_status("[2:sh]")
+            session.command(b"1")
+            session.wait_status("scroll 4/8")
+            self.assertEqual(session.screen.lines(0, 4), expected)
+
     def test_new_output_keeps_scrollback_anchored(self):
         with self.probe("lines", rows=6, columns=60,
                         environment={"MWIN_SCROLLBACK": "20"}) as session:
