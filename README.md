@@ -186,9 +186,9 @@ The tests drive the real executable through a pseudo-terminal and reconstruct
 the visible host screen. They exercise every documented key, alternate
 prefixes, exact child dimensions and environment, input forwarding, scrollback,
 resize reflow, soft-wrap copy semantics, alternate-screen isolation, process
-groups, and clean terminal restoration. Internal self-tests cover compact
-history and representative VT parsing details that are difficult to observe at
-the user interface.
+groups, and clean terminal restoration. A separate model test covers compact
+history and representative VT parsing details without adding test code to the
+installed binary.
 
 An optional coverage report can be produced when `gcov` is installed:
 

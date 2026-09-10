@@ -5,3 +5,6 @@
 /*.gcno
 /*.gcov
 /tests/__pycache__/
+/tests/model-test
+/tests/*.gcda
+/tests/*.gcno

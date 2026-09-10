@@ -1,6 +1,6 @@
 .POSIX:
 
-VERSION = 0.3.3
+VERSION = 0.3.4
 PREFIX = /usr/local
 MANPREFIX = $(PREFIX)/share/man
 
@@ -19,19 +19,22 @@ config.h:
 mwin: mwin.c config.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ mwin.c $(LDLIBS)
 
+tests/model-test: tests/model.c mwin.c config.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ tests/model.c $(LDLIBS)
+
 debug: CFLAGS = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wconversion -O0 -g3 -fsanitize=address,undefined
 debug: LDFLAGS = -fsanitize=address,undefined
-debug: clean mwin
+debug: clean mwin tests/model-test
 
-test: mwin
-	./mwin --self-test
+test: mwin tests/model-test
+	./tests/model-test --model-test
 	$(PYTHON) tests/integration.py
 
 coverage: clean
-	$(MAKE) CFLAGS='$(CFLAGS) -O0 --coverage' LDFLAGS='$(LDFLAGS) --coverage' mwin
-	./mwin --self-test
+	$(CC) $(CPPFLAGS) $(CFLAGS) -O0 --coverage $(LDFLAGS) --coverage -o mwin tests/model.c $(LDLIBS)
+	./mwin --model-test
 	$(PYTHON) tests/integration.py
-	gcov -b -c mwin.c
+	gcov -b -c tests/model.c -o mwin-model.gcno
 
 install: mwin
 	mkdir -p "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(MANPREFIX)/man1"
@@ -44,6 +47,6 @@ uninstall:
 	rm -f "$(DESTDIR)$(PREFIX)/bin/mwin" "$(DESTDIR)$(MANPREFIX)/man1/mwin.1"
 
 clean:
-	rm -f mwin *.gcda *.gcno *.gcov
+	rm -f mwin tests/model-test *.gcda *.gcno *.gcov tests/*.gcda tests/*.gcno
 
 .PHONY: all debug test coverage install uninstall clean

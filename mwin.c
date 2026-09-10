@@ -54,6 +54,9 @@
 #define COMBINING_MAX 3
 #define INPUT_CHUNK 8192
 
+static const unsigned char paste_begin[] = "\033[200~";
+static const unsigned char paste_end[] = "\033[201~";
+
 enum {
 	ATTR_BOLD      = 1u << 0,
 	ATTR_DIM       = 1u << 1,
@@ -63,6 +66,17 @@ enum {
 	ATTR_REVERSE   = 1u << 5,
 	ATTR_INVISIBLE = 1u << 6,
 	ATTR_STRIKE    = 1u << 7
+};
+
+static const struct {
+	int set;
+	int reset;
+	unsigned int flag;
+} rendition_flags[] = {
+	{1, 22, ATTR_BOLD},      {2, 22, ATTR_DIM},
+	{3, 23, ATTR_ITALIC},    {4, 24, ATTR_UNDERLINE},
+	{5, 25, ATTR_BLINK},     {7, 27, ATTR_REVERSE},
+	{8, 28, ATTR_INVISIBLE}, {9, 29, ATTR_STRIKE}
 };
 
 enum ParserState {
@@ -149,7 +163,6 @@ struct Screen {
 	bool wrap;
 	bool insert;
 	bool wrap_pending;
-	bool records_history;
 	struct Terminal *terminal;
 	struct Attr attr;
 	struct Attr saved_attr;
@@ -184,7 +197,6 @@ struct Terminal {
 	struct Buffer input;
 	struct History history;
 	size_t scroll_offset;
-	bool scrolling;
 	bool viewport_dirty;
 	char title[64];
 	bool unread;
@@ -210,7 +222,7 @@ static bool prefix_pending;
 static bool help_visible;
 static bool input_is_paste;
 static size_t paste_match_length;
-static unsigned char scroll_escape_sequence[6];
+static unsigned char scroll_escape_sequence[sizeof(paste_begin) - 1];
 static size_t scroll_escape_length;
 static bool status_enabled = SHOW_STATUS != 0;
 static unsigned char command_prefix = MWIN_CTRL(COMMAND_KEY);
@@ -218,7 +230,6 @@ static size_t scrollback_limit = DEFAULT_SCROLLBACK;
 static int host_rows = 24;
 static int host_cols = 80;
 static int signal_pipe[2] = {-1, -1};
-static volatile sig_atomic_t received_signal;
 
 static void fatal(const char *message);
 static void render(bool full);
@@ -247,12 +258,72 @@ attr_equal(struct Attr a, struct Attr b)
 static struct Cell
 blank_cell(struct Attr attr)
 {
-	struct Cell cell;
-	memset(&cell, 0, sizeof(cell));
+	struct Cell cell = {0};
+
 	cell.cp = ' ';
 	cell.width = 1;
 	cell.attr = attr;
 	return cell;
+}
+
+static int
+clamp_int(int value, int minimum, int maximum)
+{
+	if (value < minimum)
+		return minimum;
+	if (value > maximum)
+		return maximum;
+	return value;
+}
+
+static void
+fill_cells(struct Cell *cells, size_t count, struct Attr attr)
+{
+	struct Cell blank = blank_cell(attr);
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		cells[i] = blank;
+}
+
+static bool
+allocate_screen(int rows, int cols, struct Cell **cells,
+                unsigned char **dirty, unsigned char **wrapped)
+{
+	size_t count;
+
+	*cells = NULL;
+	*dirty = NULL;
+	*wrapped = NULL;
+	if (rows < 1 || cols < 1 ||
+	    (size_t)rows > SIZE_MAX / (size_t)cols ||
+	    (size_t)rows * (size_t)cols > SIZE_MAX / sizeof(**cells))
+		return false;
+	count = (size_t)rows * (size_t)cols;
+	*cells = malloc(count * sizeof(**cells));
+	*dirty = malloc((size_t)rows);
+	*wrapped = calloc((size_t)rows, sizeof(**wrapped));
+	if (*cells != NULL && *dirty != NULL && *wrapped != NULL)
+		return true;
+	free(*cells);
+	free(*dirty);
+	free(*wrapped);
+	return false;
+}
+
+static void
+replace_screen(struct Screen *screen, struct Cell *cells,
+               unsigned char *dirty, unsigned char *wrapped,
+               int rows, int cols)
+{
+	free(screen->cells);
+	free(screen->dirty);
+	free(screen->wrapped);
+	screen->cells = cells;
+	screen->dirty = dirty;
+	screen->wrapped = wrapped;
+	screen->rows = rows;
+	screen->cols = cols;
 }
 
 static void
@@ -265,9 +336,7 @@ mark_all_dirty(struct Screen *screen)
 static void
 screen_reset(struct Screen *screen)
 {
-	struct Cell blank;
 	size_t count;
-	size_t i;
 
 	screen->row = 0;
 	screen->col = 0;
@@ -282,10 +351,8 @@ screen_reset(struct Screen *screen)
 	screen->wrap_pending = false;
 	screen->attr = default_attr();
 	screen->saved_attr = screen->attr;
-	blank = blank_cell(default_attr());
 	count = (size_t)screen->rows * (size_t)screen->cols;
-	for (i = 0; i < count; i++)
-		screen->cells[i] = blank;
+	fill_cells(screen->cells, count, screen->attr);
 	memset(screen->wrapped, 0, (size_t)screen->rows);
 	mark_all_dirty(screen);
 }
@@ -294,17 +361,11 @@ static bool
 screen_init(struct Screen *screen, int rows, int cols)
 {
 	memset(screen, 0, sizeof(*screen));
+	if (!allocate_screen(rows, cols, &screen->cells, &screen->dirty,
+	                     &screen->wrapped))
+		return false;
 	screen->rows = rows;
 	screen->cols = cols;
-	screen->cells = calloc((size_t)rows * (size_t)cols, sizeof(*screen->cells));
-	screen->dirty = calloc((size_t)rows, sizeof(*screen->dirty));
-	screen->wrapped = calloc((size_t)rows, sizeof(*screen->wrapped));
-	if (screen->cells == NULL || screen->dirty == NULL || screen->wrapped == NULL) {
-		free(screen->cells);
-		free(screen->dirty);
-		free(screen->wrapped);
-		return false;
-	}
 	screen_reset(screen);
 	return true;
 }
@@ -324,48 +385,26 @@ screen_resize(struct Screen *screen, int rows, int cols)
 	struct Cell *new_cells;
 	unsigned char *new_dirty;
 	unsigned char *new_wrapped;
-	struct Cell blank = blank_cell(default_attr());
 	int copy_rows = rows < screen->rows ? rows : screen->rows;
 	int copy_cols = cols < screen->cols ? cols : screen->cols;
 	int r;
-	int c;
 
 	if (rows == screen->rows && cols == screen->cols)
 		return;
-	new_cells = malloc((size_t)rows * (size_t)cols * sizeof(*new_cells));
-	new_dirty = malloc((size_t)rows);
-	new_wrapped = calloc((size_t)rows, sizeof(*new_wrapped));
-	if (new_cells == NULL || new_dirty == NULL || new_wrapped == NULL) {
-		free(new_cells);
-		free(new_dirty);
-		free(new_wrapped);
+	if (!allocate_screen(rows, cols, &new_cells, &new_dirty, &new_wrapped))
 		return;
-	}
-	for (r = 0; r < rows; r++)
-		for (c = 0; c < cols; c++)
-			new_cells[(size_t)r * (size_t)cols + (size_t)c] = blank;
+	fill_cells(new_cells, (size_t)rows * (size_t)cols, default_attr());
 	for (r = 0; r < copy_rows; r++)
 		memcpy(&new_cells[(size_t)r * (size_t)cols],
 		       &screen->cells[(size_t)r * (size_t)screen->cols],
 		       (size_t)copy_cols * sizeof(*new_cells));
 	memcpy(new_wrapped, screen->wrapped, (size_t)copy_rows);
 	memset(new_dirty, 1, (size_t)rows);
-	free(screen->cells);
-	free(screen->dirty);
-	free(screen->wrapped);
-	screen->cells = new_cells;
-	screen->dirty = new_dirty;
-	screen->wrapped = new_wrapped;
-	screen->rows = rows;
-	screen->cols = cols;
-	if (screen->row >= rows)
-		screen->row = rows - 1;
-	if (screen->col >= cols)
-		screen->col = cols - 1;
-	if (screen->saved_row >= rows)
-		screen->saved_row = rows - 1;
-	if (screen->saved_col >= cols)
-		screen->saved_col = cols - 1;
+	replace_screen(screen, new_cells, new_dirty, new_wrapped, rows, cols);
+	screen->row = clamp_int(screen->row, 0, rows - 1);
+	screen->col = clamp_int(screen->col, 0, cols - 1);
+	screen->saved_row = clamp_int(screen->saved_row, 0, rows - 1);
+	screen->saved_col = clamp_int(screen->saved_col, 0, cols - 1);
 	screen->scroll_top = 0;
 	screen->scroll_bottom = rows - 1;
 	screen->wrap_pending = false;
@@ -429,59 +468,56 @@ normalize_row(struct Screen *screen, int row)
 }
 
 static void
-scroll_up(struct Screen *screen, int count, bool record)
+scroll_region(struct Screen *screen, int count, bool down, bool record)
 {
 	int top = screen->scroll_top;
 	int bottom = screen->scroll_bottom;
 	int height = bottom - top + 1;
+	int source;
+	int destination;
+	int first_blank;
 	int row;
 
-	if (count < 1)
-		count = 1;
-	if (count > height)
-		count = height;
-	if (record && screen->records_history && screen->terminal != NULL &&
+	count = clamp_int(count, 1, height);
+	if (!down && record && screen->terminal != NULL &&
+	    screen == &screen->terminal->primary &&
 	    top == 0 && bottom == screen->rows - 1) {
 		for (row = 0; row < count; row++)
 			history_push(screen->terminal, cell_at(screen, row, 0), screen->cols,
 			             screen->wrapped[row] != 0);
 	}
-	if (count < height)
-		memmove(cell_at(screen, top, 0), cell_at(screen, top + count, 0),
-		        (size_t)(height - count) * (size_t)screen->cols * sizeof(struct Cell));
-	if (count < height)
-		memmove(&screen->wrapped[top], &screen->wrapped[top + count],
+	if (down) {
+		source = top;
+		destination = top + count;
+		first_blank = top;
+	} else {
+		source = top + count;
+		destination = top;
+		first_blank = bottom - count + 1;
+	}
+	if (count < height) {
+		memmove(cell_at(screen, destination, 0), cell_at(screen, source, 0),
+		        (size_t)(height - count) * (size_t)screen->cols *
+		        sizeof(struct Cell));
+		memmove(&screen->wrapped[destination], &screen->wrapped[source],
 		        (size_t)(height - count));
-	memset(&screen->wrapped[bottom - count + 1], 0, (size_t)count);
-	for (row = bottom - count + 1; row <= bottom; row++)
+	}
+	for (row = first_blank; row < first_blank + count; row++)
 		blank_range(screen, row, 0, screen->cols - 1);
 	for (row = top; row <= bottom; row++)
 		screen->dirty[row] = 1;
 }
 
 static void
+scroll_up(struct Screen *screen, int count, bool record)
+{
+	scroll_region(screen, count, false, record);
+}
+
+static void
 scroll_down(struct Screen *screen, int count)
 {
-	int top = screen->scroll_top;
-	int bottom = screen->scroll_bottom;
-	int height = bottom - top + 1;
-	int row;
-
-	if (count < 1)
-		count = 1;
-	if (count > height)
-		count = height;
-	if (count < height)
-		memmove(cell_at(screen, top + count, 0), cell_at(screen, top, 0),
-		        (size_t)(height - count) * (size_t)screen->cols * sizeof(struct Cell));
-	if (count < height)
-		memmove(&screen->wrapped[top + count], &screen->wrapped[top],
-		        (size_t)(height - count));
-	memset(&screen->wrapped[top], 0, (size_t)count);
-	for (row = top; row < top + count; row++)
-		blank_range(screen, row, 0, screen->cols - 1);
-	for (row = top; row <= bottom; row++)
-		screen->dirty[row] = 1;
+	scroll_region(screen, count, true, false);
 }
 
 static void
@@ -510,6 +546,29 @@ screen_reverse_index(struct Screen *screen)
 }
 
 static void
+move_cursor(struct Screen *screen, int row, int col)
+{
+	screen->row = clamp_int(row, 0, screen->rows - 1);
+	screen->col = clamp_int(col, 0, screen->cols - 1);
+	screen->wrap_pending = false;
+}
+
+static void
+save_cursor(struct Screen *screen)
+{
+	screen->saved_row = screen->row;
+	screen->saved_col = screen->col;
+	screen->saved_attr = screen->attr;
+}
+
+static void
+restore_cursor(struct Screen *screen)
+{
+	move_cursor(screen, screen->saved_row, screen->saved_col);
+	screen->attr = screen->saved_attr;
+}
+
+static void
 erase_cell(struct Screen *screen, int row, int col)
 {
 	struct Cell *cell;
@@ -531,15 +590,12 @@ static void
 insert_cells(struct Screen *screen, int count)
 {
 	int available = screen->cols - screen->col;
-	int col;
 
-	if (count < 1)
-		count = 1;
-	if (count > available)
-		count = available;
-	for (col = screen->cols - 1; col >= screen->col + count; col--)
-		*cell_at(screen, screen->row, col) =
-			*cell_at(screen, screen->row, col - count);
+	count = clamp_int(count, 1, available);
+	if (count < available)
+		memmove(cell_at(screen, screen->row, screen->col + count),
+		        cell_at(screen, screen->row, screen->col),
+		        (size_t)(available - count) * sizeof(struct Cell));
 	blank_range(screen, screen->row, screen->col, screen->col + count - 1);
 	normalize_row(screen, screen->row);
 }
@@ -548,15 +604,12 @@ static void
 delete_cells(struct Screen *screen, int count)
 {
 	int available = screen->cols - screen->col;
-	int col;
 
-	if (count < 1)
-		count = 1;
-	if (count > available)
-		count = available;
-	for (col = screen->col; col < screen->cols - count; col++)
-		*cell_at(screen, screen->row, col) =
-			*cell_at(screen, screen->row, col + count);
+	count = clamp_int(count, 1, available);
+	if (count < available)
+		memmove(cell_at(screen, screen->row, screen->col),
+		        cell_at(screen, screen->row, screen->col + count),
+		        (size_t)(available - count) * sizeof(struct Cell));
 	blank_range(screen, screen->row, screen->cols - count, screen->cols - 1);
 	normalize_row(screen, screen->row);
 }
@@ -784,39 +837,27 @@ set_rendition(struct Screen *screen, const int *p, int count)
 
 	for (i = 0; i < count; i++) {
 		int code = p[i] < 0 ? 0 : p[i];
+		size_t flag;
+		bool handled = false;
+
 		if (code == 0)
 			screen->attr = default_attr();
-		else if (code == 1)
-			screen->attr.flags |= ATTR_BOLD;
-		else if (code == 2)
-			screen->attr.flags |= ATTR_DIM;
-		else if (code == 3)
-			screen->attr.flags |= ATTR_ITALIC;
-		else if (code == 4 || code == 21)
+		else if (code == 21)
 			screen->attr.flags |= ATTR_UNDERLINE;
-		else if (code == 5 || code == 6)
+		else if (code == 6)
 			screen->attr.flags |= ATTR_BLINK;
-		else if (code == 7)
-			screen->attr.flags |= ATTR_REVERSE;
-		else if (code == 8)
-			screen->attr.flags |= ATTR_INVISIBLE;
-		else if (code == 9)
-			screen->attr.flags |= ATTR_STRIKE;
-		else if (code == 22)
-			screen->attr.flags &= (unsigned int)~(ATTR_BOLD | ATTR_DIM);
-		else if (code == 23)
-			screen->attr.flags &= (unsigned int)~ATTR_ITALIC;
-		else if (code == 24)
-			screen->attr.flags &= (unsigned int)~ATTR_UNDERLINE;
-		else if (code == 25)
-			screen->attr.flags &= (unsigned int)~ATTR_BLINK;
-		else if (code == 27)
-			screen->attr.flags &= (unsigned int)~ATTR_REVERSE;
-		else if (code == 28)
-			screen->attr.flags &= (unsigned int)~ATTR_INVISIBLE;
-		else if (code == 29)
-			screen->attr.flags &= (unsigned int)~ATTR_STRIKE;
-		else if (code >= 30 && code <= 37)
+		for (flag = 0; flag < LEN(rendition_flags); flag++) {
+			if (code == rendition_flags[flag].set) {
+				screen->attr.flags |= rendition_flags[flag].flag;
+				handled = true;
+			} else if (code == rendition_flags[flag].reset) {
+				screen->attr.flags &= ~rendition_flags[flag].flag;
+				handled = true;
+			}
+		}
+		if (code == 0 || code == 6 || code == 21 || handled)
+			continue;
+		if (code >= 30 && code <= 37)
 			screen->attr.fg = code - 30;
 		else if (code >= 90 && code <= 97)
 			screen->attr.fg = code - 90 + 8;
@@ -830,25 +871,18 @@ set_rendition(struct Screen *screen, const int *p, int count)
 			screen->attr.bg = -1;
 		else if ((code == 38 || code == 48) && i + 2 < count && p[i + 1] == 5) {
 			int value = p[i + 2];
-			if (value >= 0 && value <= 255) {
-				if (code == 38)
-					screen->attr.fg = value;
-				else
-					screen->attr.bg = value;
-			}
+			int *color = code == 38 ? &screen->attr.fg : &screen->attr.bg;
+			if (value >= 0 && value <= 255)
+				*color = value;
 			i += 2;
 		} else if ((code == 38 || code == 48) && i + 4 < count && p[i + 1] == 2) {
 			int red = p[i + 2];
 			int green = p[i + 3];
 			int blue = p[i + 4];
+			int *color = code == 38 ? &screen->attr.fg : &screen->attr.bg;
 			if (red >= 0 && red <= 255 && green >= 0 && green <= 255 &&
-			    blue >= 0 && blue <= 255) {
-				int color = 0x1000000 | (red << 16) | (green << 8) | blue;
-				if (code == 38)
-					screen->attr.fg = color;
-				else
-					screen->attr.bg = color;
-			}
+			    blue >= 0 && blue <= 255)
+				*color = 0x1000000 | (red << 16) | (green << 8) | blue;
 			i += 4;
 		}
 	}
@@ -893,27 +927,18 @@ set_private_mode(struct Terminal *terminal, int mode, bool enabled)
 		use_alternate(terminal, enabled, enabled);
 		break;
 	case 1048:
-		if (enabled) {
-			screen->saved_row = screen->row;
-			screen->saved_col = screen->col;
-			screen->saved_attr = screen->attr;
-		} else {
-			screen->row = screen->saved_row;
-			screen->col = screen->saved_col;
-			screen->attr = screen->saved_attr;
-		}
+		if (enabled)
+			save_cursor(screen);
+		else
+			restore_cursor(screen);
 		break;
 	case 1049:
 		if (enabled) {
-			terminal->primary.saved_row = terminal->primary.row;
-			terminal->primary.saved_col = terminal->primary.col;
-			terminal->primary.saved_attr = terminal->primary.attr;
+			save_cursor(&terminal->primary);
 			use_alternate(terminal, true, true);
 		} else {
 			use_alternate(terminal, false, false);
-			terminal->primary.row = terminal->primary.saved_row;
-			terminal->primary.col = terminal->primary.saved_col;
-			terminal->primary.attr = terminal->primary.saved_attr;
+			restore_cursor(&terminal->primary);
 		}
 		break;
 	case 1000:
@@ -956,51 +981,34 @@ handle_csi(struct Terminal *terminal, char final)
 
 	switch (final) {
 	case 'A':
-		screen->row -= amount;
-		if (screen->row < (screen->origin ? screen->scroll_top : 0))
-			screen->row = screen->origin ? screen->scroll_top : 0;
-		screen->wrap_pending = false;
+		move_cursor(screen,
+		            clamp_int(screen->row - amount,
+		                      screen->origin ? screen->scroll_top : 0,
+		                      screen->rows - 1), screen->col);
 		break;
 	case 'B':
 	case 'e':
-		screen->row += amount;
-		if (screen->row > (screen->origin ? screen->scroll_bottom : screen->rows - 1))
-			screen->row = screen->origin ? screen->scroll_bottom : screen->rows - 1;
-		screen->wrap_pending = false;
+		move_cursor(screen,
+		            clamp_int(screen->row + amount, 0,
+		                      screen->origin ? screen->scroll_bottom :
+		                                       screen->rows - 1), screen->col);
 		break;
 	case 'C':
 	case 'a':
-		screen->col += amount;
-		if (screen->col >= screen->cols)
-			screen->col = screen->cols - 1;
-		screen->wrap_pending = false;
+		move_cursor(screen, screen->row, screen->col + amount);
 		break;
 	case 'D':
-		screen->col -= amount;
-		if (screen->col < 0)
-			screen->col = 0;
-		screen->wrap_pending = false;
+		move_cursor(screen, screen->row, screen->col - amount);
 		break;
 	case 'E':
-		screen->row += amount;
-		if (screen->row >= screen->rows)
-			screen->row = screen->rows - 1;
-		screen->col = 0;
-		screen->wrap_pending = false;
+		move_cursor(screen, screen->row + amount, 0);
 		break;
 	case 'F':
-		screen->row -= amount;
-		if (screen->row < 0)
-			screen->row = 0;
-		screen->col = 0;
-		screen->wrap_pending = false;
+		move_cursor(screen, screen->row - amount, 0);
 		break;
 	case 'G':
 	case '`':
-		screen->col = amount - 1;
-		if (screen->col >= screen->cols)
-			screen->col = screen->cols - 1;
-		screen->wrap_pending = false;
+		move_cursor(screen, screen->row, amount - 1);
 		break;
 	case 'H':
 	case 'f':
@@ -1008,26 +1016,13 @@ handle_csi(struct Terminal *terminal, char final)
 		col = parameter(p, count, 1, 1) - 1;
 		if (screen->origin)
 			row += screen->scroll_top;
-		if (row < (screen->origin ? screen->scroll_top : 0))
-			row = screen->origin ? screen->scroll_top : 0;
-		if (row > (screen->origin ? screen->scroll_bottom : screen->rows - 1))
-			row = screen->origin ? screen->scroll_bottom : screen->rows - 1;
-		if (col < 0)
-			col = 0;
-		if (col >= screen->cols)
-			col = screen->cols - 1;
-		screen->row = row;
-		screen->col = col;
-		screen->wrap_pending = false;
+		row = clamp_int(row, screen->origin ? screen->scroll_top : 0,
+		                screen->origin ? screen->scroll_bottom : screen->rows - 1);
+		move_cursor(screen, row, col);
 		break;
 	case 'd':
 		row = amount - 1 + (screen->origin ? screen->scroll_top : 0);
-		if (row < 0)
-			row = 0;
-		if (row >= screen->rows)
-			row = screen->rows - 1;
-		screen->row = row;
-		screen->wrap_pending = false;
+		move_cursor(screen, row, screen->col);
 		break;
 	case 'J':
 		if (parameter(p, count, 0, 0) == 3)
@@ -1077,15 +1072,10 @@ handle_csi(struct Terminal *terminal, char final)
 		}
 		break;
 	case 's':
-		screen->saved_row = screen->row;
-		screen->saved_col = screen->col;
-		screen->saved_attr = screen->attr;
+		save_cursor(screen);
 		break;
 	case 'u':
-		screen->row = screen->saved_row;
-		screen->col = screen->saved_col;
-		screen->attr = screen->saved_attr;
-		screen->wrap_pending = false;
+		restore_cursor(screen);
 		break;
 	case 'h':
 	case 'l':
@@ -1301,15 +1291,10 @@ feed_byte(struct Terminal *terminal, unsigned char byte)
 			parser->state = P_CHARSET;
 			break;
 		case '7':
-			screen->saved_row = screen->row;
-			screen->saved_col = screen->col;
-			screen->saved_attr = screen->attr;
+			save_cursor(screen);
 			break;
 		case '8':
-			screen->row = screen->saved_row;
-			screen->col = screen->saved_col;
-			screen->attr = screen->saved_attr;
-			screen->wrap_pending = false;
+			restore_cursor(screen);
 			break;
 		case 'D':
 			screen_index(screen, false);
@@ -1391,46 +1376,26 @@ feed_bytes(struct Terminal *terminal, const unsigned char *data, size_t length)
 		feed_byte(terminal, data[i]);
 }
 
-static bool
+static void
 output_append(struct Buffer *output, const char *text)
 {
-	return buffer_append(output, text, strlen(text));
+	(void)buffer_append(output, text, strlen(text));
 }
 
-static bool
+static void
 output_printf(struct Buffer *output, const char *format, ...)
 {
 	va_list arguments;
-	va_list copy;
 	int length;
-	char stack[128];
-	char *dynamic;
+	char text[192];
 
 	va_start(arguments, format);
-	va_copy(copy, arguments);
-	length = vsnprintf(stack, sizeof(stack), format, arguments);
+	length = vsnprintf(text, sizeof(text), format, arguments);
 	va_end(arguments);
-	if (length < 0) {
-		va_end(copy);
-		return false;
-	}
-	if ((size_t)length < sizeof(stack)) {
-		va_end(copy);
-		return buffer_append(output, stack, (size_t)length);
-	}
-	dynamic = malloc((size_t)length + 1);
-	if (dynamic == NULL) {
-		va_end(copy);
-		return false;
-	}
-	(void)vsnprintf(dynamic, (size_t)length + 1, format, copy);
-	va_end(copy);
-	if (!buffer_append(output, dynamic, (size_t)length)) {
-		free(dynamic);
-		return false;
-	}
-	free(dynamic);
-	return true;
+	if (length > 0)
+		(void)buffer_append(output, text,
+		                    (size_t)length < sizeof(text) ?
+		                    (size_t)length : sizeof(text) - 1);
 }
 
 static void
@@ -1481,7 +1446,7 @@ history_push(struct Terminal *terminal, const struct Cell *cells, int columns,
              bool wrapped)
 {
 	struct History *history = &terminal->history;
-	struct HistoryLine line;
+	struct HistoryLine line = {0};
 	struct Buffer text = {0};
 	struct StyleSpan *spans = NULL;
 	struct Attr previous = default_attr();
@@ -1519,7 +1484,6 @@ history_push(struct Terminal *terminal, const struct Cell *cells, int columns,
 		for (combining = 0; combining < cell->ncombining; combining++)
 			append_codepoint(&text, cell->combining[combining]);
 	}
-	memset(&line, 0, sizeof(line));
 	if (span_count == 0) {
 		free(spans);
 		spans = NULL;
@@ -1542,7 +1506,7 @@ history_push(struct Terminal *terminal, const struct Cell *cells, int columns,
 		}
 	}
 	overwriting = history->count == history->capacity;
-	viewing_oldest = terminal->scrolling &&
+	viewing_oldest = terminal->scroll_offset != 0 &&
 	                 terminal->scroll_offset == history->count;
 	if (overwriting) {
 		index = history->head;
@@ -1553,7 +1517,7 @@ history_push(struct Terminal *terminal, const struct Cell *cells, int columns,
 		history->count++;
 	}
 	history->lines[index] = line;
-	if (terminal->scrolling) {
+	if (terminal->scroll_offset != 0) {
 		if (terminal->scroll_offset < history->count)
 			terminal->scroll_offset++;
 		if (overwriting && viewing_oldest)
@@ -1574,7 +1538,6 @@ history_clear(struct Terminal *terminal)
 	history->count = 0;
 	history->head = 0;
 	terminal->scroll_offset = 0;
-	terminal->scrolling = false;
 	terminal->viewport_dirty = true;
 	if (terminal->screen != NULL)
 		mark_all_dirty(terminal->screen);
@@ -1607,9 +1570,7 @@ reflow_buffer_free(struct ReflowBuffer *buffer)
 static bool
 reflow_start_row(struct ReflowBuffer *buffer)
 {
-	struct Cell blank = blank_cell(default_attr());
 	size_t cells;
-	size_t i;
 
 	if (!buffer->need_row)
 		return true;
@@ -1642,8 +1603,7 @@ reflow_start_row(struct ReflowBuffer *buffer)
 		buffer->capacity = capacity;
 	}
 	cells = buffer->count * (size_t)buffer->cols;
-	for (i = 0; i < (size_t)buffer->cols; i++)
-		buffer->cells[cells + i] = blank;
+	fill_cells(&buffer->cells[cells], (size_t)buffer->cols, default_attr());
 	buffer->wrapped[buffer->count] = 0;
 	buffer->count++;
 	buffer->col = 0;
@@ -1736,6 +1696,24 @@ reflow_mark_position(struct ReflowBuffer *buffer, bool wrap_pending,
 }
 
 static bool
+reflow_capture_position(struct ReflowBuffer *buffer, bool cursor,
+                        bool wrap_pending)
+{
+	bool ignored;
+	bool *new_wrap = cursor ? &buffer->cursor_wrap_pending : &ignored;
+	size_t *row = cursor ? &buffer->cursor_row : &buffer->saved_row;
+	int *col = cursor ? &buffer->cursor_col : &buffer->saved_col;
+
+	if (!reflow_mark_position(buffer, wrap_pending, row, col, new_wrap))
+		return false;
+	if (cursor)
+		buffer->cursor_set = true;
+	else
+		buffer->saved_set = true;
+	return true;
+}
+
+static bool
 reflow_feed_history(struct ReflowBuffer *buffer, const struct HistoryLine *line)
 {
 	struct Attr attr = default_attr();
@@ -1820,20 +1798,12 @@ reflow_feed_screen_row(struct ReflowBuffer *buffer, const struct Screen *screen,
 		const struct Cell *cell;
 		int width;
 
-		if (col == cursor_mark) {
-			if (!reflow_mark_position(buffer, screen->wrap_pending,
-			                          &buffer->cursor_row, &buffer->cursor_col,
-			                          &buffer->cursor_wrap_pending))
-				return false;
-			buffer->cursor_set = true;
-		}
-		if (col == saved_mark) {
-			bool ignored;
-			if (!reflow_mark_position(buffer, false, &buffer->saved_row,
-			                          &buffer->saved_col, &ignored))
-				return false;
-			buffer->saved_set = true;
-		}
+		if (col == cursor_mark &&
+		    !reflow_capture_position(buffer, true, screen->wrap_pending))
+			return false;
+		if (col == saved_mark &&
+		    !reflow_capture_position(buffer, false, false))
+			return false;
 		cell = &screen->cells[(size_t)row * (size_t)screen->cols +
 		                      (size_t)col];
 		if (cell->width == 0) {
@@ -1845,20 +1815,12 @@ reflow_feed_screen_row(struct ReflowBuffer *buffer, const struct Screen *screen,
 			return false;
 		col += width;
 	}
-	if (cursor_mark == used) {
-		if (!reflow_mark_position(buffer, screen->wrap_pending,
-		                          &buffer->cursor_row, &buffer->cursor_col,
-		                          &buffer->cursor_wrap_pending))
-			return false;
-		buffer->cursor_set = true;
-	}
-	if (saved_mark == used) {
-		bool ignored;
-		if (!reflow_mark_position(buffer, false, &buffer->saved_row,
-		                          &buffer->saved_col, &ignored))
-			return false;
-		buffer->saved_set = true;
-	}
+	if (cursor_mark == used &&
+	    !reflow_capture_position(buffer, true, screen->wrap_pending))
+		return false;
+	if (saved_mark == used &&
+	    !reflow_capture_position(buffer, false, false))
+		return false;
 	return screen->wrapped[row] != 0 || reflow_hard_break(buffer);
 }
 
@@ -1866,24 +1828,17 @@ static bool
 reflow_primary(struct Terminal *terminal, int rows, int cols)
 {
 	struct Screen *screen = &terminal->primary;
-	struct ReflowBuffer buffer;
+	struct ReflowBuffer buffer = {0};
 	struct Cell *new_cells;
-	struct Cell *old_cells;
 	unsigned char *new_dirty;
 	unsigned char *new_wrapped;
-	unsigned char *old_dirty;
-	unsigned char *old_wrapped;
-	struct Cell blank = blank_cell(default_attr());
-	bool was_scrolling = terminal->scrolling;
 	size_t old_scroll_offset = terminal->scroll_offset;
 	size_t start;
 	size_t i;
 	int r;
-	int c;
 
 	if (rows == screen->rows && cols == screen->cols)
 		return true;
-	memset(&buffer, 0, sizeof(buffer));
 	buffer.cols = cols;
 	buffer.need_row = true;
 	for (i = 0; i < terminal->history.count; i++)
@@ -1899,21 +1854,9 @@ reflow_primary(struct Terminal *terminal, int rows, int cols)
 		start = buffer.cursor_row;
 	else if (buffer.cursor_row >= start + (size_t)rows)
 		start = buffer.cursor_row - (size_t)rows + 1;
-	if ((size_t)rows > SIZE_MAX / (size_t)cols ||
-	    (size_t)rows * (size_t)cols > SIZE_MAX / sizeof(*new_cells))
+	if (!allocate_screen(rows, cols, &new_cells, &new_dirty, &new_wrapped))
 		goto fail;
-	new_cells = malloc((size_t)rows * (size_t)cols * sizeof(*new_cells));
-	new_dirty = malloc((size_t)rows);
-	new_wrapped = calloc((size_t)rows, sizeof(*new_wrapped));
-	if (new_cells == NULL || new_dirty == NULL || new_wrapped == NULL) {
-		free(new_cells);
-		free(new_dirty);
-		free(new_wrapped);
-		goto fail;
-	}
-	for (r = 0; r < rows; r++)
-		for (c = 0; c < cols; c++)
-			new_cells[(size_t)r * (size_t)cols + (size_t)c] = blank;
+	fill_cells(new_cells, (size_t)rows * (size_t)cols, default_attr());
 	for (r = 0; r < rows && start + (size_t)r < buffer.count; r++) {
 		memcpy(&new_cells[(size_t)r * (size_t)cols],
 		       &buffer.cells[(start + (size_t)r) * (size_t)cols],
@@ -1921,14 +1864,7 @@ reflow_primary(struct Terminal *terminal, int rows, int cols)
 		new_wrapped[r] = buffer.wrapped[start + (size_t)r];
 	}
 	memset(new_dirty, 1, (size_t)rows);
-	old_cells = screen->cells;
-	old_dirty = screen->dirty;
-	old_wrapped = screen->wrapped;
-	screen->cells = new_cells;
-	screen->dirty = new_dirty;
-	screen->wrapped = new_wrapped;
-	screen->rows = rows;
-	screen->cols = cols;
+	replace_screen(screen, new_cells, new_dirty, new_wrapped, rows, cols);
 	screen->row = (int)(buffer.cursor_row - start);
 	screen->col = buffer.cursor_col;
 	screen->wrap_pending = buffer.cursor_wrap_pending;
@@ -1944,19 +1880,13 @@ reflow_primary(struct Terminal *terminal, int rows, int cols)
 	}
 	screen->scroll_top = 0;
 	screen->scroll_bottom = rows - 1;
-	terminal->scrolling = false;
 	history_clear(terminal);
 	for (i = 0; i < start; i++)
 		history_push(terminal, &buffer.cells[i * (size_t)cols], cols,
 		             buffer.wrapped[i] != 0);
-	terminal->scrolling = was_scrolling && terminal->history.count != 0;
-	terminal->scroll_offset = terminal->scrolling ?
-	                          (old_scroll_offset < terminal->history.count ?
-	                           old_scroll_offset : terminal->history.count) : 0;
+	terminal->scroll_offset = old_scroll_offset < terminal->history.count ?
+	                          old_scroll_offset : terminal->history.count;
 	terminal->viewport_dirty = true;
-	free(old_cells);
-	free(old_dirty);
-	free(old_wrapped);
 	reflow_buffer_free(&buffer);
 	return true;
 
@@ -1968,39 +1898,23 @@ fail:
 static void
 append_attr(struct Buffer *output, struct Attr attr)
 {
+	const int colors[] = {attr.fg, attr.bg};
+	const int selectors[] = {38, 48};
+	size_t i;
+
 	(void)output_append(output, "\033[0");
-	if ((attr.flags & ATTR_BOLD) != 0)
-		(void)output_append(output, ";1");
-	if ((attr.flags & ATTR_DIM) != 0)
-		(void)output_append(output, ";2");
-	if ((attr.flags & ATTR_ITALIC) != 0)
-		(void)output_append(output, ";3");
-	if ((attr.flags & ATTR_UNDERLINE) != 0)
-		(void)output_append(output, ";4");
-	if ((attr.flags & ATTR_BLINK) != 0)
-		(void)output_append(output, ";5");
-	if ((attr.flags & ATTR_REVERSE) != 0)
-		(void)output_append(output, ";7");
-	if ((attr.flags & ATTR_INVISIBLE) != 0)
-		(void)output_append(output, ";8");
-	if ((attr.flags & ATTR_STRIKE) != 0)
-		(void)output_append(output, ";9");
-	if (attr.fg >= 0) {
-		if ((attr.fg & 0x1000000) != 0)
-			(void)output_printf(output, ";38;2;%d;%d;%d",
-			                    (attr.fg >> 16) & 255,
-			                    (attr.fg >> 8) & 255, attr.fg & 255);
-		else
-			(void)output_printf(output, ";38;5;%d", attr.fg);
-	}
-	if (attr.bg >= 0) {
-		if ((attr.bg & 0x1000000) != 0)
-			(void)output_printf(output, ";48;2;%d;%d;%d",
-			                    (attr.bg >> 16) & 255,
-			                    (attr.bg >> 8) & 255, attr.bg & 255);
-		else
-			(void)output_printf(output, ";48;5;%d", attr.bg);
-	}
+	for (i = 0; i < LEN(rendition_flags); i++)
+		if ((attr.flags & rendition_flags[i].flag) != 0)
+			(void)output_printf(output, ";%d", rendition_flags[i].set);
+	for (i = 0; i < LEN(colors); i++)
+		if (colors[i] >= 0) {
+			if ((colors[i] & 0x1000000) != 0)
+				(void)output_printf(output, ";%d;2;%d;%d;%d", selectors[i],
+				                    (colors[i] >> 16) & 255,
+				                    (colors[i] >> 8) & 255, colors[i] & 255);
+			else
+				(void)output_printf(output, ";%d;5;%d", selectors[i], colors[i]);
+		}
 	(void)output_append(output, "m");
 }
 
@@ -2137,18 +2051,6 @@ viewport_history_line(struct Terminal *terminal, size_t first, int display_row,
 	return NULL;
 }
 
-static bool
-viewport_row_wrapped(struct Terminal *terminal, size_t first, int display_row)
-{
-	int screen_row;
-	const struct HistoryLine *line = viewport_history_line(terminal, first,
-	                                                     display_row, &screen_row);
-
-	if (screen_row >= 0)
-		return terminal->screen->wrapped[screen_row] != 0;
-	return line != NULL && line->wrapped;
-}
-
 static void
 append_screen_rows(struct Buffer *output, struct Screen *screen, int first,
                    int last)
@@ -2173,6 +2075,7 @@ append_viewport(struct Buffer *output, struct Terminal *terminal)
 	struct Screen *screen = terminal->screen;
 	struct Attr previous = {0, 0, UINT32_MAX};
 	size_t first = terminal->history.count - terminal->scroll_offset;
+	bool wrapped = false;
 	int display_row;
 
 	(void)output_append(output, "\033[1;1H");
@@ -2181,17 +2084,18 @@ append_viewport(struct Buffer *output, struct Terminal *terminal)
 		const struct HistoryLine *line = viewport_history_line(terminal, first,
 		                                                        display_row,
 		                                                        &screen_row);
-		if (screen_row >= 0)
+		if (screen_row >= 0) {
 			append_screen_cells(output, screen, screen_row, &previous);
-		else
+			wrapped = screen->wrapped[screen_row] != 0;
+		} else {
 			append_history_cells(output, line, screen->cols, &previous);
-		if (display_row + 1 < screen->rows &&
-		    !viewport_row_wrapped(terminal, first, display_row))
+			wrapped = line != NULL && line->wrapped;
+		}
+		if (display_row + 1 < screen->rows && !wrapped)
 			(void)output_append(output, "\r\n");
 	}
 	(void)output_append(output, "\033[0m");
-	if (screen->rows < host_rows &&
-	    !viewport_row_wrapped(terminal, first, screen->rows - 1))
+	if (screen->rows < host_rows && !wrapped)
 		(void)output_append(output, "\r\n");
 }
 
@@ -2215,57 +2119,50 @@ key_text(unsigned char key, char text[4])
 }
 
 static void
+append_bar(struct Buffer *output, const char *text, size_t length)
+{
+	if ((int)length > host_cols)
+		length = (size_t)host_cols;
+	(void)output_printf(output, "\033[%d;1H\033[0;7m", host_rows);
+	(void)buffer_append(output, text, length);
+	while ((int)length < host_cols) {
+		(void)buffer_append(output, " ", 1);
+		length++;
+	}
+	(void)output_append(output, "\033[0m");
+}
+
+static void
 append_status(struct Buffer *output)
 {
-	char status[4096];
-	size_t used = 0;
+	struct Buffer status = {0};
 	size_t i;
-	int status_row = host_rows;
 
 	if (!status_enabled || host_rows < 2)
 		return;
 	if (prefix_pending) {
 		char key[4];
-		int written = snprintf(status, sizeof(status),
-		                       " prefix %s: waiting for key",
-		                       key_text(command_prefix, key));
-		if (written > 0)
-			used = (size_t)written < sizeof(status) ?
-			       (size_t)written : sizeof(status) - 1;
-	} else if (windows[active_window]->scrolling) {
+		output_printf(&status, " prefix %s: waiting for key",
+		              key_text(command_prefix, key));
+	} else if (windows[active_window]->scroll_offset != 0) {
 		const char *title = windows[active_window]->title[0] == '\0' ?
 		                    "shell" : windows[active_window]->title;
-		int written = snprintf(status, sizeof(status),
-		                       "[%zu:%s] scroll %zu/%zu  ^U/^D page  k/j line  g/G oldest/live  Esc exit",
-		                       active_window + 1, title,
-		                       windows[active_window]->scroll_offset,
-		                       windows[active_window]->history.count);
-		if (written > 0)
-			used = (size_t)written < sizeof(status) ? (size_t)written : sizeof(status) - 1;
-	} else for (i = 0; i < window_count && used + 8 < sizeof(status); i++) {
+		output_printf(&status,
+		              "[%zu:%s] scroll %zu/%zu  ^U/^D page  k/j line  g/G oldest/live  Esc exit",
+		              active_window + 1, title,
+		              windows[active_window]->scroll_offset,
+		              windows[active_window]->history.count);
+	} else for (i = 0; i < window_count; i++) {
 		const char *title = windows[i]->title[0] == '\0' ? "shell" : windows[i]->title;
-		int written = snprintf(status + used, sizeof(status) - used,
-		                       "%s%s%zu:%s%s",
-		                       i == 0 ? "" : "  ", i == active_window ? "[" : "",
-		                       i + 1, title, i == active_window ? "]" :
-		                       (windows[i]->unread ? "*" : ""));
-		if (written < 0)
+		output_printf(&status, "%s%s%zu:%s%s",
+		              i == 0 ? "" : "  ", i == active_window ? "[" : "",
+		              i + 1, title, i == active_window ? "]" :
+		              (windows[i]->unread ? "*" : ""));
+		if (status.length >= (size_t)host_cols)
 			break;
-		if ((size_t)written >= sizeof(status) - used) {
-			used = sizeof(status) - 1;
-			break;
-		}
-		used += (size_t)written;
 	}
-	if ((int)used > host_cols)
-		used = (size_t)host_cols;
-	(void)output_printf(output, "\033[%d;1H\033[0;7m", status_row);
-	(void)buffer_append(output, status, used);
-	while ((int)used < host_cols) {
-		(void)buffer_append(output, " ", 1);
-		used++;
-	}
-	(void)output_append(output, "\033[0m");
+	append_bar(output, (const char *)status.data, status.length);
+	buffer_free(&status);
 }
 
 static void
@@ -2282,15 +2179,7 @@ append_help(struct Buffer *output)
 	               prefix_text, prefix_text);
 	length = strlen(help);
 
-	if ((int)length > host_cols)
-		length = (size_t)host_cols;
-	(void)output_printf(output, "\033[%d;1H\033[0;7m", host_rows);
-	(void)buffer_append(output, help, length);
-	while ((int)length < host_cols) {
-		(void)buffer_append(output, " ", 1);
-		length++;
-	}
-	(void)output_append(output, "\033[0m");
+	append_bar(output, help, length);
 }
 
 static void
@@ -2362,7 +2251,7 @@ render(bool full)
 		mark_all_dirty(screen);
 	}
 	append_host_modes(&output, terminal);
-	if (terminal->scrolling) {
+	if (terminal->scroll_offset != 0) {
 		if (full || terminal->viewport_dirty) {
 			append_viewport(&output, terminal);
 			terminal->viewport_dirty = false;
@@ -2392,7 +2281,7 @@ render(bool full)
 	append_status(&output);
 	if (help_visible)
 		append_help(&output);
-	if (screen->cursor_visible && !help_visible && !terminal->scrolling) {
+	if (screen->cursor_visible && !help_visible && terminal->scroll_offset == 0) {
 		(void)output_printf(&output, "\033[%d;%dH\033[?25h",
 		                    screen->row + 1, screen->col + 1);
 	} else {
@@ -2483,7 +2372,6 @@ spawn_terminal(char *const argv[])
 	struct Terminal *terminal;
 	struct winsize size;
 	char *slave_name;
-	char slave_path[256];
 	int master;
 	int slave;
 	pid_t pid;
@@ -2495,12 +2383,11 @@ spawn_terminal(char *const argv[])
 		return NULL;
 	}
 	slave_name = ptsname(master);
-	if (slave_name == NULL || strlen(slave_name) >= sizeof(slave_path)) {
+	if (slave_name == NULL) {
 		close(master);
 		return NULL;
 	}
-	(void)strcpy(slave_path, slave_name);
-	slave = open(slave_path, O_RDWR | O_NOCTTY);
+	slave = open(slave_name, O_RDWR | O_NOCTTY);
 	if (slave < 0) {
 		close(master);
 		return NULL;
@@ -2519,6 +2406,10 @@ spawn_terminal(char *const argv[])
 	}
 	if (pid == 0) {
 		struct sigaction action;
+		const int signals[] = {SIGCHLD, SIGWINCH, SIGINT,
+		                       SIGTERM, SIGHUP, SIGQUIT};
+		size_t i;
+
 		close(master);
 		if (setsid() < 0)
 			_exit(126);
@@ -2532,11 +2423,8 @@ spawn_terminal(char *const argv[])
 		memset(&action, 0, sizeof(action));
 		action.sa_handler = SIG_DFL;
 		(void)sigemptyset(&action.sa_mask);
-		(void)sigaction(SIGCHLD, &action, NULL);
-		(void)sigaction(SIGWINCH, &action, NULL);
-		(void)sigaction(SIGINT, &action, NULL);
-		(void)sigaction(SIGTERM, &action, NULL);
-		(void)sigaction(SIGHUP, &action, NULL);
+		for (i = 0; i < LEN(signals); i++)
+			(void)sigaction(signals[i], &action, NULL);
 		(void)setenv("TERM", CHILD_TERM, 1);
 		(void)setenv("MWIN", "1", 1);
 		execvp(argv[0], argv);
@@ -2571,9 +2459,7 @@ spawn_terminal(char *const argv[])
 		(void)kill(pid, SIGHUP);
 		return NULL;
 	}
-	terminal->primary.records_history = true;
 	terminal->primary.terminal = terminal;
-	terminal->alternate.terminal = terminal;
 	terminal->screen = &terminal->primary;
 	return terminal;
 }
@@ -2644,26 +2530,6 @@ remove_window(size_t index, bool terminate)
 }
 
 static ssize_t
-find_window_by_fd(int fd)
-{
-	size_t i;
-	for (i = 0; i < window_count; i++)
-		if (windows[i]->fd == fd)
-			return (ssize_t)i;
-	return -1;
-}
-
-static ssize_t
-find_window_by_pid(pid_t pid)
-{
-	size_t i;
-	for (i = 0; i < window_count; i++)
-		if (windows[i]->pid == pid)
-			return (ssize_t)i;
-	return -1;
-}
-
-static ssize_t
 find_window(struct Terminal *terminal)
 {
 	size_t i;
@@ -2718,9 +2584,8 @@ select_previous_window(void)
 static void
 new_shell(void)
 {
-	char *arguments[2];
-	arguments[0] = (char *)shell_path();
-	arguments[1] = NULL;
+	char *arguments[] = {(char *)shell_path(), NULL};
+
 	if (!add_window(arguments)) {
 		ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
 		(void)ignored;
@@ -2738,7 +2603,6 @@ scroll_backward(struct Terminal *terminal, size_t amount)
 {
 	if (terminal->screen != &terminal->primary || terminal->history.count == 0)
 		return;
-	terminal->scrolling = true;
 	if (amount > terminal->history.count - terminal->scroll_offset)
 		terminal->scroll_offset = terminal->history.count;
 	else
@@ -2750,8 +2614,8 @@ scroll_backward(struct Terminal *terminal, size_t amount)
 static void
 scroll_to_live(struct Terminal *terminal)
 {
-	bool changed = terminal->scrolling;
-	terminal->scrolling = false;
+	bool changed = terminal->scroll_offset != 0;
+
 	terminal->scroll_offset = 0;
 	terminal->viewport_dirty = false;
 	if (changed)
@@ -2761,7 +2625,7 @@ scroll_to_live(struct Terminal *terminal)
 static void
 scroll_forward(struct Terminal *terminal, size_t amount)
 {
-	if (!terminal->scrolling)
+	if (terminal->scroll_offset == 0)
 		return;
 	if (amount >= terminal->scroll_offset) {
 		scroll_to_live(terminal);
@@ -2789,9 +2653,7 @@ handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
 		scroll_forward(terminal, 1);
 		break;
 	case 'g':
-		terminal->scroll_offset = terminal->history.count;
-		terminal->viewport_dirty = true;
-		render(true);
+		scroll_backward(terminal, terminal->history.count);
 		break;
 	case 'G':
 	case '\033':
@@ -2859,7 +2721,7 @@ handle_regular_input(unsigned char byte)
 		render(true);
 		return;
 	}
-	if (windows[active_window]->scrolling) {
+	if (windows[active_window]->scroll_offset != 0) {
 		handle_scrollback_key(windows[active_window], byte);
 		return;
 	}
@@ -2880,8 +2742,6 @@ handle_regular_input(unsigned char byte)
 static void
 observe_paste_byte(unsigned char byte)
 {
-	static const unsigned char paste_begin[] = "\033[200~";
-	static const unsigned char paste_end[] = "\033[201~";
 	const unsigned char *wanted = input_is_paste ? paste_end : paste_begin;
 	const size_t wanted_length = sizeof(paste_begin) - 1;
 
@@ -2919,7 +2779,6 @@ flush_scroll_escape(void)
 static void
 handle_input(const unsigned char *data, size_t length)
 {
-	static const unsigned char paste_begin[] = "\033[200~";
 	size_t i;
 
 	for (i = 0; i < length && running; i++) {
@@ -2940,7 +2799,7 @@ handle_input(const unsigned char *data, size_t length)
 			continue;
 		}
 		if (!input_is_paste && byte == '\033' &&
-		    windows[active_window]->scrolling) {
+		    windows[active_window]->scroll_offset != 0) {
 			handle_regular_input(byte);
 			scroll_escape_sequence[0] = byte;
 			scroll_escape_length = 1;
@@ -2996,12 +2855,9 @@ read_terminal(struct Terminal *terminal)
 		}
 	}
 	if (received) {
-		if (window_count != 0 && windows[active_window] == terminal)
-			render(false);
-		else {
+		if (window_count == 0 || windows[active_window] != terminal)
 			terminal->unread = true;
-			render(false);
-		}
+		render(false);
 	}
 	return true;
 }
@@ -3044,7 +2900,6 @@ signal_handler(int signal_number)
 {
 	unsigned char byte = (unsigned char)signal_number;
 	ssize_t ignored;
-	received_signal = signal_number;
 	if (signal_pipe[1] >= 0) {
 		ignored = write(signal_pipe[1], &byte, 1);
 		(void)ignored;
@@ -3075,12 +2930,14 @@ reap_children(void)
 {
 	pid_t pid;
 	int status;
+	size_t i;
 
-	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-		ssize_t index = find_window_by_pid(pid);
-		if (index >= 0)
-			windows[index]->pid = -1;
-	}
+	while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+		for (i = 0; i < window_count; i++)
+			if (windows[i]->pid == pid) {
+				windows[i]->pid = -1;
+				break;
+			}
 }
 
 static void
@@ -3106,7 +2963,6 @@ handle_signals(void)
 			}
 		}
 	} while (length > 0);
-	received_signal = 0;
 	if (child)
 		reap_children();
 	if (resized)
@@ -3119,6 +2975,7 @@ static void
 event_loop(void)
 {
 	struct pollfd descriptors[MAX_WINDOWS + 2];
+	struct Terminal *polled[MAX_WINDOWS];
 	unsigned char input[INPUT_CHUNK];
 
 	while (running && window_count != 0) {
@@ -3133,6 +2990,7 @@ event_loop(void)
 		descriptors[count].events = POLLIN;
 		descriptors[count++].revents = 0;
 		for (i = 0; i < window_count; i++) {
+			polled[i] = windows[i];
 			descriptors[count].fd = windows[i]->fd;
 			descriptors[count].events = POLLIN;
 			if (windows[i]->input.offset < windows[i]->input.length)
@@ -3142,8 +3000,7 @@ event_loop(void)
 		result = poll(descriptors, count, scroll_escape_length == 0 ? -1 : 30);
 		if (result < 0) {
 			if (errno == EINTR) {
-				if (received_signal != 0)
-					handle_signals();
+				handle_signals();
 				continue;
 			}
 			break;
@@ -3164,17 +3021,15 @@ event_loop(void)
 				running = false;
 		}
 		for (i = 2; i < (size_t)count && running && window_count != 0; i++) {
-			ssize_t index = find_window_by_fd(descriptors[i].fd);
+			struct Terminal *terminal = polled[i - 2];
+			ssize_t index = find_window(terminal);
 			if (index < 0)
 				continue;
 			if ((descriptors[i].revents & POLLOUT) != 0)
-				flush_input(windows[index]);
-			index = find_window_by_fd(descriptors[i].fd);
-			if (index < 0)
-				continue;
+				flush_input(terminal);
 			if ((descriptors[i].revents & (POLLIN | POLLHUP | POLLERR)) != 0 &&
-			    !read_terminal(windows[index])) {
-				index = find_window_by_fd(descriptors[i].fd);
+			    !read_terminal(terminal)) {
+				index = find_window(terminal);
 				if (index >= 0)
 					remove_window((size_t)index, false);
 			}
@@ -3232,401 +3087,29 @@ scrollback_from_environment(void)
 
 	if (text == NULL)
 		return DEFAULT_SCROLLBACK;
-	if (text[0] == '\0') {
-		fprintf(stderr, "mwin: invalid MWIN_SCROLLBACK value: %s\n", text);
-		exit(2);
-	}
+	if (text[0] == '\0')
+		goto invalid;
 	for (cursor = text; *cursor != '\0'; cursor++)
-		if (!isdigit((unsigned char)*cursor)) {
-			fprintf(stderr, "mwin: invalid MWIN_SCROLLBACK value: %s\n", text);
-			exit(2);
-		}
+		if (!isdigit((unsigned char)*cursor))
+			goto invalid;
 	errno = 0;
 	value = strtoull(text, &end, 10);
-	if (*end != '\0' || errno == ERANGE || value > SIZE_MAX) {
-		fprintf(stderr, "mwin: invalid MWIN_SCROLLBACK value: %s\n", text);
-		exit(2);
-	}
+	if (*end != '\0' || errno == ERANGE || value > SIZE_MAX)
+		goto invalid;
 	return (size_t)value;
+
+invalid:
+	fprintf(stderr, "mwin: invalid MWIN_SCROLLBACK value: %s\n", text);
+	exit(2);
 }
 
-#define TEST_CHECK(condition) do { \
-	if (!(condition)) { \
-		fprintf(stderr, "self-test: %s:%d: %s\n", \
-		        __func__, __LINE__, #condition); \
-		failed = 1; \
-	} \
-} while (0)
-
-static bool
-row_starts_with(const struct Screen *screen, int row, const char *text)
-{
-	int col;
-
-	for (col = 0; text[col] != '\0'; col++) {
-		if (col >= screen->cols ||
-		    screen->cells[(size_t)row * (size_t)screen->cols +
-		                  (size_t)col].cp != (unsigned char)text[col])
-			return false;
-	}
-	return true;
-}
-
-static int
-test_vt_commands(void)
-{
-	struct Terminal terminal;
-	struct Screen *screen;
-	struct Cell *cell;
-	const unsigned char edits[] = "abcd\033[2D\033[@X\033[2G\033[P";
-	const unsigned char lines[] = "111\r\n222\r\n333\033[2;1H\033[L\033[M";
-	const unsigned char movements[] =
-		"\033[3;4H\033[2A\033[B\033[2C\033[D\033[E\033[F"
-		"\033[5G\033[4d\033[2;3f";
-	const unsigned char modes_on[] =
-		"\033[?1;7;25;1002;1004;1006;2004h\033[4h\033=";
-	const unsigned char modes_off[] =
-		"\033[?1;7;25;1002;1004;1006;2004l\033[4l\033>";
-	const unsigned char styled[] =
-		"\033[1;2;3;4;5;7;8;9;38;5;123;48;2;1;2;3mX";
-	const unsigned char style_reset[] =
-		"\033[22;23;24;25;27;28;29;39;49mY";
-	const unsigned char queries[] = "\033[5n\033[6n\033[c\033[>c";
-	const char expected_replies[] =
-		"\033[0n\033[2;3R\033[?1;2c\033[>1;0;0c";
-	const unsigned char unicode[] = {'A', 0xcc, 0x81, 0xe7, 0x95, 0x8c,
-	                                 0xc0, 'Z'};
-	int failed = 0;
-	int world_width;
-
-	memset(&terminal, 0, sizeof(terminal));
-	if (!screen_init(&terminal.primary, 4, 8) ||
-	    !screen_init(&terminal.alternate, 4, 8)) {
-		fprintf(stderr, "self-test: test_vt_commands: allocation failed\n");
-		screen_free(&terminal.primary);
-		screen_free(&terminal.alternate);
-		return 1;
-	}
-	terminal.primary.records_history = true;
-	terminal.primary.terminal = &terminal;
-	terminal.alternate.terminal = &terminal;
-	terminal.screen = &terminal.primary;
-	terminal.parser.state = P_GROUND;
-	screen = terminal.screen;
-
-	feed_bytes(&terminal, edits, sizeof(edits) - 1);
-	TEST_CHECK(row_starts_with(screen, 0, "aXcd"));
-	feed_bytes(&terminal, (const unsigned char *)"\033[2G\033[2X",
-	           strlen("\033[2G\033[2X"));
-	TEST_CHECK(cell_at(screen, 0, 0)->cp == 'a');
-	TEST_CHECK(cell_at(screen, 0, 1)->cp == ' ');
-	TEST_CHECK(cell_at(screen, 0, 2)->cp == ' ');
-	TEST_CHECK(cell_at(screen, 0, 3)->cp == 'd');
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, lines, sizeof(lines) - 1);
-	TEST_CHECK(row_starts_with(screen, 0, "111"));
-	TEST_CHECK(row_starts_with(screen, 1, "222"));
-	TEST_CHECK(row_starts_with(screen, 2, "333"));
-	TEST_CHECK(cell_at(screen, 3, 0)->cp == ' ');
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, (const unsigned char *)"abcdef\033[3G\033[1K",
-	           strlen("abcdef\033[3G\033[1K"));
-	TEST_CHECK(cell_at(screen, 0, 0)->cp == ' ' &&
-	           cell_at(screen, 0, 2)->cp == ' ' &&
-	           cell_at(screen, 0, 3)->cp == 'd');
-	feed_bytes(&terminal, (const unsigned char *)"\033[4G\033[K",
-	           strlen("\033[4G\033[K"));
-	TEST_CHECK(cell_at(screen, 0, 3)->cp == ' ' &&
-	           cell_at(screen, 0, 5)->cp == ' ');
-	feed_bytes(&terminal, (const unsigned char *)"xy\r\nz\033[1J",
-	           strlen("xy\r\nz\033[1J"));
-	TEST_CHECK(cell_at(screen, 0, 0)->cp == ' ' &&
-	           cell_at(screen, 1, 0)->cp == ' ');
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, movements, sizeof(movements) - 1);
-	TEST_CHECK(screen->row == 1 && screen->col == 2);
-	feed_bytes(&terminal, (const unsigned char *)"\033[2;4r\033[?6h\033[1;1H",
-	           strlen("\033[2;4r\033[?6h\033[1;1H"));
-	TEST_CHECK(screen->origin && screen->row == 1 && screen->col == 0);
-	feed_bytes(&terminal, (const unsigned char *)"\033M\033D\033E\033[?6l",
-	           strlen("\033M\033D\033E\033[?6l"));
-	TEST_CHECK(!screen->origin && screen->row == 0 && screen->col == 0);
-
-	feed_bytes(&terminal, modes_on, sizeof(modes_on) - 1);
-	TEST_CHECK(terminal.app_cursor && terminal.app_keypad &&
-	           terminal.mouse_mode == 1002 && terminal.mouse_sgr &&
-	           terminal.focus_events && terminal.bracketed_paste &&
-	           screen->wrap && screen->cursor_visible && screen->insert);
-	feed_bytes(&terminal, modes_off, sizeof(modes_off) - 1);
-	TEST_CHECK(!terminal.app_cursor && !terminal.app_keypad &&
-	           terminal.mouse_mode == 0 && !terminal.mouse_sgr &&
-	           !terminal.focus_events && !terminal.bracketed_paste &&
-	           !screen->wrap && !screen->cursor_visible && !screen->insert);
-	feed_bytes(&terminal, (const unsigned char *)"\033[?7;25h",
-	           strlen("\033[?7;25h"));
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, styled, sizeof(styled) - 1);
-	cell = cell_at(screen, 0, 0);
-	TEST_CHECK(cell->attr.flags == (ATTR_BOLD | ATTR_DIM | ATTR_ITALIC |
-	                                ATTR_UNDERLINE | ATTR_BLINK | ATTR_REVERSE |
-	                                ATTR_INVISIBLE | ATTR_STRIKE));
-	TEST_CHECK(cell->attr.fg == 123);
-	TEST_CHECK(cell->attr.bg == (0x1000000 | (1 << 16) | (2 << 8) | 3));
-	feed_bytes(&terminal, style_reset, sizeof(style_reset) - 1);
-	cell = cell_at(screen, 0, 1);
-	TEST_CHECK(cell->attr.flags == 0 && cell->attr.fg == -1 && cell->attr.bg == -1);
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, (const unsigned char *)"\033[2;3H",
-	           strlen("\033[2;3H"));
-	feed_bytes(&terminal, queries, sizeof(queries) - 1);
-	TEST_CHECK(terminal.input.length == sizeof(expected_replies) - 1);
-	TEST_CHECK(memcmp(terminal.input.data, expected_replies,
-	                  sizeof(expected_replies) - 1) == 0);
-	buffer_free(&terminal.input);
-
-	feed_bytes(&terminal, (const unsigned char *)"\033]2;hello\001world\a", 16);
-	TEST_CHECK(strcmp(terminal.title, "hello world") == 0);
-	feed_bytes(&terminal, (const unsigned char *)"\033]0;again\033\\", 11);
-	TEST_CHECK(strcmp(terminal.title, "again") == 0);
-	feed_bytes(&terminal, (const unsigned char *)"\033Pignored\033\\Q", 12);
-	TEST_CHECK(cell_at(screen, 1, 2)->cp == 'Q');
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, unicode, sizeof(unicode));
-	world_width = wcwidth((wchar_t)0x754c) == 2 ? 2 : 1;
-	TEST_CHECK(cell_at(screen, 0, 0)->cp == 'A');
-	TEST_CHECK(cell_at(screen, 0, 0)->ncombining == 1 &&
-	           cell_at(screen, 0, 0)->combining[0] == 0x301);
-	TEST_CHECK(cell_at(screen, 0, 1)->cp == 0x754c &&
-	           cell_at(screen, 0, 1)->width == world_width);
-	TEST_CHECK(cell_at(screen, 0, 1 + world_width)->cp == 0xfffd);
-	TEST_CHECK(cell_at(screen, 0, 2 + world_width)->cp == 'Z');
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, (const unsigned char *)"ab\bX\tY\033)0\016l\017l\vV\fF",
-	           strlen("ab\bX\tY\033)0\016l\017l\vV\fF"));
-	TEST_CHECK(cell_at(screen, 0, 0)->cp == 'a' &&
-	           cell_at(screen, 0, 1)->cp == 'X' &&
-	           cell_at(screen, 0, 7)->cp == 'Y');
-	TEST_CHECK(cell_at(screen, 1, 0)->cp == 0x250c &&
-	           cell_at(screen, 1, 1)->cp == 'l');
-	TEST_CHECK(cell_at(screen, 2, 2)->cp == 'V' &&
-	           cell_at(screen, 3, 3)->cp == 'F');
-
-	terminal_reset(&terminal);
-	feed_bytes(&terminal, (const unsigned char *)"save\0337\033[4;8H\0338",
-	           strlen("save\0337\033[4;8H\0338"));
-	TEST_CHECK(screen->row == 0 && screen->col == 4);
-	feed_bytes(&terminal, (const unsigned char *)"\033[s\033[3;3H\033[u",
-	           strlen("\033[s\033[3;3H\033[u"));
-	TEST_CHECK(screen->row == 0 && screen->col == 4);
-	feed_bytes(&terminal, (const unsigned char *)"\033[?47hA\033[?47l",
-	           strlen("\033[?47hA\033[?47l"));
-	TEST_CHECK(terminal.screen == &terminal.primary &&
-	           cell_at(&terminal.alternate, 0, 0)->cp == 'A');
-
-	history_free(&terminal);
-	buffer_free(&terminal.input);
-	screen_free(&terminal.primary);
-	screen_free(&terminal.alternate);
-	return failed;
-}
-
-static int
-test_model_and_reflow(void)
-{
-	struct Terminal terminal;
-	struct Terminal history_terminal;
-	struct Terminal reflow_terminal;
-	struct ReflowBuffer combining_buffer;
-	struct Screen *screen;
-	const struct HistoryLine *line;
-	const unsigned char basic[] = "abc\033[2;2HZ\033[31mR\033[0m";
-	const unsigned char alternate[] = "\033[?1049hALT\033[?1049l";
-	const unsigned char erase[] = "\033[2J\033[Hok";
-	const unsigned char line_drawing[] = "\033(0lqk\033(B";
-	const unsigned char scrolling[] = "a\r\n\033[31mb\033[0m\r\nc\r\nd\r\n";
-	const unsigned char alternate_scrolling[] = "\033[?1049h1\r\n2\r\n3\r\n\033[?1049l";
-	const unsigned char clear_history[] = "\033[3J";
-	const unsigned char long_line[] = "\033[31mabcdefghij\033[0m";
-	const unsigned char combined[] = {'A', 0xcc, 0x81};
-	int failed = 0;
-
-	memset(&terminal, 0, sizeof(terminal));
-	memset(&history_terminal, 0, sizeof(history_terminal));
-	windows[0] = &terminal;
-	windows[1] = &history_terminal;
-	window_count = 2;
-	active_window = 0;
-	previous_window = NULL;
-	TEST_CHECK(activate_window(1) && active_window == 1 &&
-	           previous_window == &terminal && activate_previous_window() &&
-	           active_window == 0 && previous_window == &history_terminal &&
-	           activate_previous_window() && active_window == 1 &&
-	           previous_window == &terminal);
-	previous_window = &reflow_terminal;
-	TEST_CHECK(!activate_previous_window() && previous_window == NULL);
-	window_count = 0;
-	active_window = 0;
-	previous_window = NULL;
-	memset(&terminal, 0, sizeof(terminal));
-	if (!screen_init(&terminal.primary, 3, 8) ||
-	    !screen_init(&terminal.alternate, 3, 8)) {
-		fprintf(stderr, "self-test: allocation failed\n");
-		return 1;
-	}
-	terminal.screen = &terminal.primary;
-	terminal.parser.state = P_GROUND;
-	feed_bytes(&terminal, basic, sizeof(basic) - 1);
-	screen = &terminal.primary;
-	TEST_CHECK(cell_at(screen, 0, 0)->cp == 'a' &&
-	           cell_at(screen, 0, 2)->cp == 'c' &&
-	           cell_at(screen, 1, 1)->cp == 'Z' &&
-	           cell_at(screen, 1, 2)->cp == 'R' &&
-	           cell_at(screen, 1, 2)->attr.fg == 1);
-	feed_bytes(&terminal, alternate, sizeof(alternate) - 1);
-	TEST_CHECK(terminal.screen == &terminal.primary &&
-	           cell_at(&terminal.alternate, 0, 0)->cp == 'A' &&
-	           cell_at(&terminal.primary, 0, 0)->cp == 'a');
-	feed_bytes(&terminal, erase, sizeof(erase) - 1);
-	TEST_CHECK(cell_at(&terminal.primary, 0, 0)->cp == 'o' &&
-	           cell_at(&terminal.primary, 0, 1)->cp == 'k' &&
-	           cell_at(&terminal.primary, 1, 1)->cp == ' ');
-	feed_bytes(&terminal, line_drawing, sizeof(line_drawing) - 1);
-	TEST_CHECK(cell_at(&terminal.primary, 0, 2)->cp == 0x250c &&
-	           cell_at(&terminal.primary, 0, 3)->cp == 0x2500 &&
-	           cell_at(&terminal.primary, 0, 4)->cp == 0x2510);
-	screen_free(&terminal.primary);
-	screen_free(&terminal.alternate);
-	memset(&history_terminal, 0, sizeof(history_terminal));
-	history_terminal.history.capacity = 2;
-	if (!screen_init(&history_terminal.primary, 2, 4) ||
-	    !screen_init(&history_terminal.alternate, 2, 4)) {
-		fprintf(stderr, "self-test: history allocation failed\n");
-		return 1;
-	}
-	history_terminal.primary.records_history = true;
-	history_terminal.primary.terminal = &history_terminal;
-	history_terminal.screen = &history_terminal.primary;
-	history_terminal.parser.state = P_GROUND;
-	feed_bytes(&history_terminal, scrolling, sizeof(scrolling) - 1);
-	line = history_line(&history_terminal.history, 0);
-	TEST_CHECK(history_terminal.history.count == 2 && line != NULL &&
-	           line->length == 1 && line->text[0] == 'b' &&
-	           line->span_count == 1 && line->spans[0].attr.fg == 1);
-	line = history_line(&history_terminal.history, 1);
-	TEST_CHECK(line != NULL && line->length == 1 && line->text[0] == 'c' &&
-	           line->span_count == 0);
-	feed_bytes(&history_terminal, alternate_scrolling, sizeof(alternate_scrolling) - 1);
-	TEST_CHECK(history_terminal.history.count == 2);
-	feed_bytes(&history_terminal, clear_history, sizeof(clear_history) - 1);
-	TEST_CHECK(history_terminal.history.count == 0);
-	terminal_reset(&history_terminal);
-	feed_bytes(&history_terminal, combined, sizeof(combined));
-	history_push(&history_terminal, cell_at(&history_terminal.primary, 0, 0),
-	             history_terminal.primary.cols, false);
-	line = history_line(&history_terminal.history, 0);
-	memset(&combining_buffer, 0, sizeof(combining_buffer));
-	combining_buffer.cols = 2;
-	combining_buffer.need_row = true;
-	TEST_CHECK(line != NULL && reflow_feed_history(&combining_buffer, line) &&
-	           combining_buffer.count != 0 &&
-	           combining_buffer.cells[0].cp == 'A' &&
-	           combining_buffer.cells[0].ncombining == 1 &&
-	           combining_buffer.cells[0].combining[0] == 0x301);
-	reflow_buffer_free(&combining_buffer);
-	history_free(&history_terminal);
-	screen_free(&history_terminal.primary);
-	screen_free(&history_terminal.alternate);
-	memset(&reflow_terminal, 0, sizeof(reflow_terminal));
-	reflow_terminal.history.capacity = 16;
-	if (!screen_init(&reflow_terminal.primary, 3, 6) ||
-	    !screen_init(&reflow_terminal.alternate, 3, 6)) {
-		fprintf(stderr, "self-test: reflow allocation failed\n");
-		return 1;
-	}
-	reflow_terminal.primary.records_history = true;
-	reflow_terminal.primary.terminal = &reflow_terminal;
-	reflow_terminal.alternate.terminal = &reflow_terminal;
-	reflow_terminal.screen = &reflow_terminal.primary;
-	reflow_terminal.parser.state = P_GROUND;
-	feed_bytes(&reflow_terminal, long_line, sizeof(long_line) - 1);
-	TEST_CHECK(reflow_terminal.primary.wrapped[0] != 0 &&
-	           reflow_primary(&reflow_terminal, 3, 4));
-	line = history_line(&reflow_terminal.history, 0);
-	TEST_CHECK(reflow_terminal.history.count == 1 && line != NULL &&
-	           line->wrapped && line->length == 4 &&
-	           memcmp(line->text, "abcd", 4) == 0 && line->span_count == 1 &&
-	           line->spans[0].attr.fg == 1 &&
-	           cell_at(&reflow_terminal.primary, 0, 0)->cp == 'e' &&
-	           cell_at(&reflow_terminal.primary, 0, 3)->cp == 'h' &&
-	           reflow_terminal.primary.wrapped[0] != 0 &&
-	           cell_at(&reflow_terminal.primary, 1, 0)->cp == 'i' &&
-	           cell_at(&reflow_terminal.primary, 1, 1)->cp == 'j' &&
-	           reflow_terminal.primary.row == 1 &&
-	           reflow_terminal.primary.col == 2);
-	TEST_CHECK(reflow_primary(&reflow_terminal, 3, 6) &&
-	           reflow_terminal.history.count == 0 &&
-	           cell_at(&reflow_terminal.primary, 0, 0)->cp == 'a' &&
-	           cell_at(&reflow_terminal.primary, 0, 0)->attr.fg == 1 &&
-	           cell_at(&reflow_terminal.primary, 0, 5)->cp == 'f' &&
-	           reflow_terminal.primary.wrapped[0] != 0 &&
-	           cell_at(&reflow_terminal.primary, 1, 0)->cp == 'g' &&
-	           cell_at(&reflow_terminal.primary, 1, 3)->cp == 'j' &&
-	           reflow_terminal.primary.row == 1 &&
-	           reflow_terminal.primary.col == 4);
-	terminal_reset(&reflow_terminal);
-	feed_bytes(&reflow_terminal, (const unsigned char *)"one\r\ntwo\r\nthree", 15);
-	TEST_CHECK(reflow_primary(&reflow_terminal, 2, 6));
-	line = history_line(&reflow_terminal.history, 0);
-	TEST_CHECK(reflow_terminal.history.count == 1 && line != NULL &&
-	           !line->wrapped && line->length == 3 &&
-	           memcmp(line->text, "one", 3) == 0 &&
-	           cell_at(&reflow_terminal.primary, 0, 0)->cp == 't' &&
-	           cell_at(&reflow_terminal.primary, 1, 0)->cp == 't' &&
-	           reflow_terminal.primary.row == 1 &&
-	           reflow_terminal.primary.col == 5);
-	TEST_CHECK(reflow_primary(&reflow_terminal, 3, 6) &&
-	           reflow_terminal.history.count == 0 &&
-	           cell_at(&reflow_terminal.primary, 0, 0)->cp == 'o' &&
-	           cell_at(&reflow_terminal.primary, 1, 0)->cp == 't' &&
-	           cell_at(&reflow_terminal.primary, 2, 0)->cp == 't' &&
-	           reflow_terminal.primary.row == 2 &&
-	           reflow_terminal.primary.col == 5);
-	history_free(&reflow_terminal);
-	screen_free(&reflow_terminal.primary);
-	screen_free(&reflow_terminal.alternate);
-	return failed;
-}
-
-static int
-self_test(void)
-{
-	int failed = 0;
-
-	failed |= test_vt_commands();
-	failed |= test_model_and_reflow();
-	if (failed) {
-		fprintf(stderr, "self-test: failed\n");
-		return 1;
-	}
-	puts("self-test: ok");
-	return 0;
-}
-
-#undef TEST_CHECK
 
 static void
 usage(FILE *stream)
 {
 	fprintf(stream,
 	        "usage: mwin [-s] [-c key] [command [argument ...]]\n"
-	        "       mwin -h | -v | --self-test\n");
+	        "       mwin -h | -v\n");
 }
 
 int
@@ -3637,8 +3120,6 @@ main(int argc, char **argv)
 	int option;
 
 	(void)setlocale(LC_CTYPE, "");
-	if (argc == 2 && strcmp(argv[1], "--self-test") == 0)
-		return self_test();
 	if (argc == 2 && strcmp(argv[1], "--help") == 0) {
 		usage(stdout);
 		return 0;
