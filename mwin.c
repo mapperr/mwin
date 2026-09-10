@@ -2149,7 +2149,7 @@ append_status(struct Buffer *output)
 		const char *title = windows[active_window]->title[0] == '\0' ?
 		                    "shell" : windows[active_window]->title;
 		output_printf(&status,
-		              "[%zu:%s] scroll %zu/%zu  ^U/^D half  ^B/^F page  y/e line  g/G oldest/live  Esc live",
+		              "[%zu:%s] scroll %zu/%zu  ^U/^D half  ^B/^F page  k/j line  e editor  g/G oldest/live  Esc live",
 		              active_window + 1, title,
 		              windows[active_window]->scroll_offset,
 		              windows[active_window]->history.count);
@@ -2176,7 +2176,7 @@ append_help(struct Buffer *output)
 
 	prefix_text = key_text(command_prefix, key);
 	(void)snprintf(help, sizeof(help),
-	               " %s m:new  o:last  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  ^E:edit  %s:send ",
+	               " %s m:new  o:last  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  ^E:editor  %s:send ",
 	               prefix_text, prefix_text);
 	length = strlen(help);
 
@@ -2762,11 +2762,14 @@ handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
 	case MWIN_CTRL('f'):
 		scroll_forward(terminal, scroll_page(terminal));
 		break;
-	case 'y':
+	case 'k':
 		scroll_backward(terminal, 1);
 		break;
-	case 'e':
+	case 'j':
 		scroll_forward(terminal, 1);
+		break;
+	case 'e':
+		edit_scrollback();
 		break;
 	case 'g':
 		scroll_backward(terminal, terminal->history.count);

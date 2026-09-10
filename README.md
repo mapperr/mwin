@@ -116,8 +116,9 @@ Each window has an independent in-memory history. While browsing it:
 | `Ctrl-d` | half a page forward |
 | `Ctrl-b` | one page backward |
 | `Ctrl-f` | one page forward |
-| `y` | one row upward/older |
-| `e` | one row downward/newer |
+| `k` | one row upward/older |
+| `j` | one row downward/newer |
+| `e` | open the retained scrollback in `$EDITOR` |
 | `g` | oldest retained row |
 | `G` | live terminal |
 | `Esc` | leave scrollback and return to the live terminal |
@@ -126,9 +127,10 @@ Window commands remain available with the usual prefix while browsing. The
 scrollback position belongs to the window, so switching away and back restores
 the same view.
 
-`Ctrl-o Ctrl-e` writes a plain-text snapshot of the retained history and live
-screen, joins soft-wrapped rows, and opens it in a new window using
-`${EDITOR:-vi}`. The temporary file is removed when that window closes.
+`e` (while browsing) and `Ctrl-o Ctrl-e` (from any view) write a plain-text
+snapshot of the retained history and live screen, join soft-wrapped rows, and
+open it using `${EDITOR:-vi}`. The temporary file is removed when that window
+closes.
 
 New output continues to be parsed while browsing and the visible position
 remains anchored. The history records only rows that leave the top of the
@@ -160,7 +162,7 @@ The default is 2000 rows per window and can be changed in `config.h`.
 
 - `SHELL`: shell created by `Ctrl-o m`; falls back to the login shell and then
   `/bin/sh`.
-- `EDITOR`: command used by `Ctrl-o Ctrl-e`; defaults to `vi`.
+- `EDITOR`: command used by `e` or `Ctrl-o Ctrl-e`; defaults to `vi`.
 - `MWIN_SCROLLBACK`: maximum retained rows per window; defaults to 2000 and
   accepts `0` to disable history.
 - `TERM`: describes the hosting terminal. Children receive the value configured

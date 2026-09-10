@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.3.6" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.7" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -89,11 +89,14 @@ Move one page backward.
 .B Ctrl-f
 Move one page forward.
 .TP
-.B y
+.B k
 Move one row upward toward older output.
 .TP
-.B e
+.B j
 Move one row downward toward newer output.
+.TP
+.B e
+Open a plain-text snapshot of the retained scrollback in the editor.
 .TP
 .B g
 Move to the oldest retained row.
@@ -108,10 +111,10 @@ Prefixed window commands remain available while browsing. The scrollback
 position is retained independently when switching away from a window and is
 restored when returning to it.
 .PP
-The prefixed Ctrl-e command writes the retained history and current screen to a
-plain-text snapshot, joins soft-wrapped rows, and opens it in a new window with
-the command from EDITOR, or vi when unset. The temporary file is removed when
-the editor window closes.
+The e command while browsing, or prefixed Ctrl-e from any view, writes the
+retained history and current screen to a plain-text snapshot, joins
+soft-wrapped rows, and opens it in a new window with the command from EDITOR,
+or vi when unset. The temporary file is removed when the editor window closes.
 .PP
 Incoming output continues to be processed while scrollback is visible. Only
 rows scrolled off the primary screen are retained; alternate-screen activity

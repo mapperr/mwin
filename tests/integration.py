@@ -346,6 +346,7 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.wait_status("prefix ^O: waiting for key")
             session.send(b"?")
             session.wait_status("^O m:new")
+            self.assertIn("^E:editor", session.screen.line(7))
             session.send(b"z")
             session.wait_status("[1:READY]")
             before = session.screen.lines(0, 6)
@@ -479,9 +480,9 @@ class TerminalInterfaceTests(unittest.TestCase):
                              ["L04", "L05", "L06", "L07", "L08"])
             session.send(b"\x02")
             session.wait_status("scroll 5/5")
-            session.send(b"e")
+            session.send(b"j")
             session.wait_status("scroll 4/5")
-            session.send(b"y")
+            session.send(b"k")
             session.wait_status("scroll 5/5")
             session.send(b"\x04")
             session.wait_status("scroll 3/5")
@@ -522,26 +523,38 @@ class TerminalInterfaceTests(unittest.TestCase):
     def test_edit_scrollback_with_editor(self):
         captured = b"H0\nH1\nabcdefghij\nKLMN\nEND"
         digest = hashlib.sha256(captured).hexdigest()[:16]
-        with tempfile.TemporaryDirectory() as directory:
-            marker = Path(directory) / "editor-path"
-            environment = {
-                "EDITOR": "%s %s editor" % (sys.executable, PROBE),
-                "MWIN_PROBE_MARKER": str(marker),
-                "MWIN_SCROLLBACK": "20",
-            }
-            with self.probe("capture", rows=6, columns=4,
-                            environment=environment) as session:
-                session.wait_text("END")
-                session.command(b"\x05")
-                session.wait_for(marker.exists, "editor temporary path")
-                session.resize(6, 80)
-                session.wait_status("[2:EDITOR-%s]" % digest)
-                temporary = Path(marker.read_text())
-                self.assertEqual(temporary.read_bytes(), captured)
-                session.command(b"\x18")
-                session.wait_status("[1:CAPTURE]")
-                session.wait_for(lambda: not temporary.exists(),
-                                 "temporary file cleanup")
+        for prefixed in (False, True):
+            binding = "Ctrl-o Ctrl-e" if prefixed else "e"
+            with self.subTest(binding=binding), \
+                    tempfile.TemporaryDirectory() as directory:
+                marker = Path(directory) / "editor-path"
+                environment = {
+                    "EDITOR": "%s %s editor" % (sys.executable, PROBE),
+                    "MWIN_PROBE_MARKER": str(marker),
+                    "MWIN_SCROLLBACK": "20",
+                }
+                with self.probe("capture", rows=6, columns=4,
+                                environment=environment) as session:
+                    session.wait_text("END")
+                    if prefixed:
+                        session.command(b"\x05")
+                    else:
+                        session.command(b"\x15")
+                        session.wait_for(
+                            lambda: session.screen.lines(0, 4) ==
+                            ["H0", "H1", "abcd", "efgh", "ij"],
+                            "scrollback viewport",
+                        )
+                        session.send(b"e")
+                    session.wait_for(marker.exists, "editor temporary path")
+                    session.resize(6, 80)
+                    session.wait_status("[2:EDITOR-%s]" % digest)
+                    temporary = Path(marker.read_text())
+                    self.assertEqual(temporary.read_bytes(), captured)
+                    session.command(b"\x18")
+                    session.wait_status("[1:CAPTURE]")
+                    session.wait_for(lambda: not temporary.exists(),
+                                     "temporary file cleanup")
 
     def test_new_output_keeps_scrollback_anchored(self):
         with self.probe("lines", rows=6, columns=60,
