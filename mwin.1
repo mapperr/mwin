@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.3.5" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.6" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -59,7 +59,10 @@ Send SIGHUP to the current window's process group and close it.
 Redraw the screen.
 .TP
 .B Ctrl-u
-Enter scrollback and move one page backward.
+Enter scrollback and move half a page backward.
+.TP
+.B Ctrl-e
+Open a plain-text snapshot of the retained scrollback in the editor.
 .TP
 .B ?
 Display the key summary until another key is pressed.
@@ -75,15 +78,21 @@ the status line is disabled with
 Once scrollback is active, the following keys need no prefix:
 .TP
 .B Ctrl-u
-Move one page backward.
+Move half a page backward.
 .TP
 .B Ctrl-d
+Move half a page forward.
+.TP
+.B Ctrl-b
+Move one page backward.
+.TP
+.B Ctrl-f
 Move one page forward.
 .TP
-.B k
+.B y
 Move one row upward toward older output.
 .TP
-.B j
+.B e
 Move one row downward toward newer output.
 .TP
 .B g
@@ -99,6 +108,11 @@ Prefixed window commands remain available while browsing. The scrollback
 position is retained independently when switching away from a window and is
 restored when returning to it.
 .PP
+The prefixed Ctrl-e command writes the retained history and current screen to a
+plain-text snapshot, joins soft-wrapped rows, and opens it in a new window with
+the command from EDITOR, or vi when unset. The temporary file is removed when
+the editor window closes.
+.PP
 Incoming output continues to be processed while scrollback is visible. Only
 rows scrolled off the primary screen are retained; alternate-screen activity
 is excluded. Soft-wrapped primary-screen and historical lines are reflowed
@@ -113,6 +127,9 @@ insert a newline that was absent from the original output.
 .TP
 .B SHELL
 Shell used for new windows. The user's login shell and /bin/sh are fallbacks.
+.TP
+.B EDITOR
+Editor command used to open scrollback snapshots. The default is vi.
 .TP
 .B MWIN_SCROLLBACK
 Maximum number of scrollback rows retained independently for each window.

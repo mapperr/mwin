@@ -3,6 +3,7 @@
 
 import errno
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -469,33 +470,33 @@ class TerminalInterfaceTests(unittest.TestCase):
                              ["L08", "L09", "L10", "L11", "LIVE"],
                              "live output")
             session.command(b"\x15")
+            session.wait_status("scroll 2/5")
+            self.assertEqual(session.screen.lines(0, 4),
+                             ["L06", "L07", "L08", "L09", "L10"])
+            session.send(b"\x15")
             session.wait_status("scroll 4/5")
             self.assertEqual(session.screen.lines(0, 4),
                              ["L04", "L05", "L06", "L07", "L08"])
-            session.send(b"\x15")
+            session.send(b"\x02")
             session.wait_status("scroll 5/5")
-            self.assertEqual(session.screen.lines(0, 4),
-                             ["L03", "L04", "L05", "L06", "L07"])
-            session.send(b"j")
+            session.send(b"e")
             session.wait_status("scroll 4/5")
-            session.send(b"k")
-            session.wait_status("scroll 5/5")
-            session.send(b"j")
-            session.wait_status("scroll 4/5")
-            session.send(b"g")
+            session.send(b"y")
             session.wait_status("scroll 5/5")
             session.send(b"\x04")
-            session.wait_status("scroll 1/5")
-            session.send(b"\x04")
+            session.wait_status("scroll 3/5")
+            session.send(b"\x06")
             session.wait_status("[1:LINES-")
             self.assertEqual(session.screen.lines(0, 4),
                              ["L08", "L09", "L10", "L11", "LIVE"])
             session.command(b"\x15")
-            session.wait_status("scroll 4/5")
+            session.wait_status("scroll 2/5")
+            session.send(b"g")
+            session.wait_status("scroll 5/5")
             session.send(b"G")
             session.wait_status("[1:LINES-")
             session.command(b"\x15")
-            session.wait_status("scroll 4/5")
+            session.wait_status("scroll 2/5")
             session.send(b"\x1b")
             session.wait_status("[1:LINES-")
             session.send(b"x")
@@ -507,7 +508,7 @@ class TerminalInterfaceTests(unittest.TestCase):
                         environment=environment) as session:
             session.wait_text("LIVE")
             session.command(b"\x15")
-            session.wait_status("scroll 4/8")
+            session.wait_status("scroll 2/8")
             expected = session.screen.lines(0, 4)
 
             session.send(CTRL_O)
@@ -515,8 +516,32 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.send(b"m")
             session.wait_status("[2:sh]")
             session.command(b"1")
-            session.wait_status("scroll 4/8")
+            session.wait_status("scroll 2/8")
             self.assertEqual(session.screen.lines(0, 4), expected)
+
+    def test_edit_scrollback_with_editor(self):
+        captured = b"H0\nH1\nabcdefghij\nKLMN\nEND"
+        digest = hashlib.sha256(captured).hexdigest()[:16]
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "editor-path"
+            environment = {
+                "EDITOR": "%s %s editor" % (sys.executable, PROBE),
+                "MWIN_PROBE_MARKER": str(marker),
+                "MWIN_SCROLLBACK": "20",
+            }
+            with self.probe("capture", rows=6, columns=4,
+                            environment=environment) as session:
+                session.wait_text("END")
+                session.command(b"\x05")
+                session.wait_for(marker.exists, "editor temporary path")
+                session.resize(6, 80)
+                session.wait_status("[2:EDITOR-%s]" % digest)
+                temporary = Path(marker.read_text())
+                self.assertEqual(temporary.read_bytes(), captured)
+                session.command(b"\x18")
+                session.wait_status("[1:CAPTURE]")
+                session.wait_for(lambda: not temporary.exists(),
+                                 "temporary file cleanup")
 
     def test_new_output_keeps_scrollback_anchored(self):
         with self.probe("lines", rows=6, columns=60,
@@ -526,11 +551,11 @@ class TerminalInterfaceTests(unittest.TestCase):
             self.assertIsNotNone(match)
             child_pid = int(match.group(1))
             session.command(b"\x15")
-            session.wait_status("scroll 4/8")
-            self.assertEqual(session.screen.line(0), "L04")
+            session.wait_status("scroll 2/8")
+            self.assertEqual(session.screen.line(0), "L06")
             os.kill(child_pid, signal.SIGUSR1)
-            session.wait_status("scroll 5/9")
-            self.assertEqual(session.screen.line(0), "L04")
+            session.wait_status("scroll 3/9")
+            self.assertEqual(session.screen.line(0), "L06")
 
     def test_zero_scrollback_never_enters_browse_mode(self):
         with self.probe("lines", rows=6, columns=60,
@@ -555,6 +580,7 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.wait_for(lambda: session.screen.lines(0, 2) == ["j", "KLM", "N"],
                              "reflowed output at three columns")
             session.command(b"\x15")
+            session.send(b"g")
             session.wait_for(lambda: session.screen.lines(0, 5) ==
                              ["abc", "def", "ghi", "j", "KLM", "N"],
                              "reflowed scrollback at three columns")

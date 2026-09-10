@@ -190,6 +190,7 @@ struct Parser {
 struct Terminal {
 	int fd;
 	pid_t pid;
+	char *temporary_path;
 	struct Screen primary;
 	struct Screen alternate;
 	struct Screen *screen;
@@ -1398,7 +1399,7 @@ output_printf(struct Buffer *output, const char *format, ...)
 		                    (size_t)length : sizeof(text) - 1);
 }
 
-static void
+static bool
 append_codepoint(struct Buffer *output, uint32_t cp)
 {
 	unsigned char encoded[4];
@@ -1423,7 +1424,7 @@ append_codepoint(struct Buffer *output, uint32_t cp)
 		encoded[3] = (unsigned char)(0x80u | (cp & 0x3fu));
 		length = 4;
 	}
-	(void)buffer_append(output, encoded, length);
+	return buffer_append(output, encoded, length);
 }
 
 static bool
@@ -2148,7 +2149,7 @@ append_status(struct Buffer *output)
 		const char *title = windows[active_window]->title[0] == '\0' ?
 		                    "shell" : windows[active_window]->title;
 		output_printf(&status,
-		              "[%zu:%s] scroll %zu/%zu  ^U/^D page  k/j line  g/G oldest/live  Esc exit",
+		              "[%zu:%s] scroll %zu/%zu  ^U/^D half  ^B/^F page  y/e line  g/G oldest/live  Esc live",
 		              active_window + 1, title,
 		              windows[active_window]->scroll_offset,
 		              windows[active_window]->history.count);
@@ -2175,7 +2176,7 @@ append_help(struct Buffer *output)
 
 	prefix_text = key_text(command_prefix, key);
 	(void)snprintf(help, sizeof(help),
-	               " %s m:new  o:last  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  %s:send ",
+	               " %s m:new  o:last  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  ^E:edit  %s:send ",
 	               prefix_text, prefix_text);
 	length = strlen(help);
 
@@ -2218,7 +2219,7 @@ append_host_modes(struct Buffer *output, struct Terminal *terminal)
 	mouse_sgr = terminal->mouse_sgr;
 }
 
-static void
+static bool
 write_all(int fd, const unsigned char *data, size_t length)
 {
 	while (length != 0) {
@@ -2229,9 +2230,88 @@ write_all(int fd, const unsigned char *data, size_t length)
 		} else if (written < 0 && errno == EINTR) {
 			continue;
 		} else {
-			break;
+			return false;
 		}
 	}
+	return true;
+}
+
+static bool
+append_plain_screen_row(struct Buffer *output, const struct Screen *screen,
+                        int row)
+{
+	int last = screen_row_last(screen, row);
+	int col;
+
+	for (col = 0; col < last; col++) {
+		const struct Cell *cell = &screen->cells[(size_t)row *
+		                                                (size_t)screen->cols +
+		                                                (size_t)col];
+		unsigned int combining;
+
+		if (cell->width == 0)
+			continue;
+		if (!append_codepoint(output, cell->cp == 0 ? ' ' : cell->cp))
+			return false;
+		for (combining = 0; combining < cell->ncombining; combining++)
+			if (!append_codepoint(output, cell->combining[combining]))
+				return false;
+	}
+	return true;
+}
+
+static bool
+append_scrollback_text(struct Buffer *output, const struct Terminal *terminal)
+{
+	const struct Screen *screen = terminal->screen;
+	size_t i;
+	int row;
+
+	if (screen == &terminal->primary) {
+		for (i = 0; i < terminal->history.count; i++) {
+			const struct HistoryLine *line = history_line(&terminal->history, i);
+
+			if (line == NULL ||
+			    !buffer_append(output, line->text, line->length) ||
+			    (!line->wrapped && !buffer_append(output, "\n", 1)))
+				return false;
+		}
+	}
+	for (row = 0; row < screen->rows; row++) {
+		if (!append_plain_screen_row(output, screen, row) ||
+		    (row + 1 < screen->rows && screen->wrapped[row] == 0 &&
+		     !buffer_append(output, "\n", 1)))
+			return false;
+	}
+	return true;
+}
+
+static char *
+save_scrollback(struct Terminal *terminal)
+{
+	struct Buffer text = {0};
+	char *path = strdup("/tmp/mwin-scrollback-XXXXXX");
+	int fd;
+	bool saved;
+
+	if (path == NULL)
+		return NULL;
+	fd = mkstemp(path);
+	if (fd < 0) {
+		free(path);
+		return NULL;
+	}
+	saved = append_scrollback_text(&text, terminal) &&
+	        write_all(fd, text.data, text.length);
+	if (close(fd) < 0)
+		saved = false;
+	buffer_free(&text);
+	if (!saved) {
+		(void)unlink(path);
+		free(path);
+		return NULL;
+	}
+	return path;
 }
 
 static void
@@ -2496,6 +2576,10 @@ free_terminal(struct Terminal *terminal, bool terminate)
 	screen_free(&terminal->alternate);
 	history_free(terminal);
 	buffer_free(&terminal->input);
+	if (terminal->temporary_path != NULL) {
+		(void)unlink(terminal->temporary_path);
+		free(terminal->temporary_path);
+	}
 	free(terminal);
 }
 
@@ -2598,6 +2682,32 @@ scroll_page(const struct Terminal *terminal)
 	return terminal->screen->rows > 1 ? (size_t)(terminal->screen->rows - 1) : 1;
 }
 
+static size_t
+scroll_half_page(const struct Terminal *terminal)
+{
+	return (scroll_page(terminal) + 1) / 2;
+}
+
+static void
+edit_scrollback(void)
+{
+	char *path = save_scrollback(windows[active_window]);
+	char *arguments[] = {"/bin/sh", "-c", "exec ${EDITOR:-vi} \"$1\"",
+	                     "mwin-editor", path, NULL};
+	ssize_t ignored;
+
+	if (path != NULL && add_window(arguments)) {
+		windows[active_window]->temporary_path = path;
+		return;
+	}
+	if (path != NULL) {
+		(void)unlink(path);
+		free(path);
+	}
+	ignored = write(STDOUT_FILENO, "\a", 1);
+	(void)ignored;
+}
+
 static void
 scroll_backward(struct Terminal *terminal, size_t amount)
 {
@@ -2641,15 +2751,21 @@ handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
 {
 	switch (byte) {
 	case MWIN_CTRL('u'):
-		scroll_backward(terminal, scroll_page(terminal));
+		scroll_backward(terminal, scroll_half_page(terminal));
 		break;
 	case MWIN_CTRL('d'):
+		scroll_forward(terminal, scroll_half_page(terminal));
+		break;
+	case MWIN_CTRL('b'):
+		scroll_backward(terminal, scroll_page(terminal));
+		break;
+	case MWIN_CTRL('f'):
 		scroll_forward(terminal, scroll_page(terminal));
 		break;
-	case 'k':
+	case 'y':
 		scroll_backward(terminal, 1);
 		break;
-	case 'j':
+	case 'e':
 		scroll_forward(terminal, 1);
 		break;
 	case 'g':
@@ -2694,7 +2810,11 @@ handle_command(unsigned char byte)
 		render(true);
 		break;
 	case MWIN_CTRL('u'):
-		scroll_backward(windows[active_window], scroll_page(windows[active_window]));
+		scroll_backward(windows[active_window],
+		                scroll_half_page(windows[active_window]));
+		break;
+	case MWIN_CTRL('e'):
+		edit_scrollback();
 		break;
 	case '?':
 		help_visible = true;

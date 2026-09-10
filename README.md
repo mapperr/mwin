@@ -84,7 +84,8 @@ The default command prefix is `Ctrl-o`:
 | `Ctrl-o 1` … `9`, `0` | select window 1 … 10 |
 | `Ctrl-o Ctrl-x` | close the current window and its process group |
 | `Ctrl-o Ctrl-l` | redraw everything |
-| `Ctrl-o Ctrl-u` | enter scrollback and move one page backward |
+| `Ctrl-o Ctrl-u` | enter scrollback and move half a page backward |
+| `Ctrl-o Ctrl-e` | open the retained scrollback in `$EDITOR` |
 | `Ctrl-o ?` | show the key summary |
 | `Ctrl-o Ctrl-o` | send a literal `Ctrl-o` to the application |
 
@@ -111,10 +112,12 @@ Each window has an independent in-memory history. While browsing it:
 
 | Key | Action |
 | --- | --- |
-| `Ctrl-u` | one page backward |
-| `Ctrl-d` | one page forward |
-| `k` | one row upward/older |
-| `j` | one row downward/newer |
+| `Ctrl-u` | half a page backward |
+| `Ctrl-d` | half a page forward |
+| `Ctrl-b` | one page backward |
+| `Ctrl-f` | one page forward |
+| `y` | one row upward/older |
+| `e` | one row downward/newer |
 | `g` | oldest retained row |
 | `G` | live terminal |
 | `Esc` | leave scrollback and return to the live terminal |
@@ -122,6 +125,10 @@ Each window has an independent in-memory history. While browsing it:
 Window commands remain available with the usual prefix while browsing. The
 scrollback position belongs to the window, so switching away and back restores
 the same view.
+
+`Ctrl-o Ctrl-e` writes a plain-text snapshot of the retained history and live
+screen, joins soft-wrapped rows, and opens it in a new window using
+`${EDITOR:-vi}`. The temporary file is removed when that window closes.
 
 New output continues to be parsed while browsing and the visible position
 remains anchored. The history records only rows that leave the top of the
@@ -153,6 +160,7 @@ The default is 2000 rows per window and can be changed in `config.h`.
 
 - `SHELL`: shell created by `Ctrl-o m`; falls back to the login shell and then
   `/bin/sh`.
+- `EDITOR`: command used by `Ctrl-o Ctrl-e`; defaults to `vi`.
 - `MWIN_SCROLLBACK`: maximum retained rows per window; defaults to 2000 and
   accepts `0` to disable history.
 - `TERM`: describes the hosting terminal. Children receive the value configured
@@ -189,10 +197,10 @@ Python 3 is required only for the integration tests, not to build or run mwin.
 The tests drive the real executable through a pseudo-terminal and reconstruct
 the visible host screen. They exercise every documented key, alternate
 prefixes, exact child dimensions and environment, input forwarding, scrollback,
-resize reflow, soft-wrap copy semantics, alternate-screen isolation, process
-groups, and clean terminal restoration. A separate model test covers compact
-history and representative VT parsing details without adding test code to the
-installed binary.
+editor snapshots and temporary-file cleanup, resize reflow, soft-wrap copy
+semantics, alternate-screen isolation, process groups, and clean terminal
+restoration. A separate model test covers compact history and representative VT
+parsing details without adding test code to the installed binary.
 
 An optional coverage report can be produced when `gcov` is installed:
 
