@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.3.7" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.8" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -125,7 +125,9 @@ limit; when MWIN_SCROLLBACK is 0, content outside the live screen is discarded.
 .PP
 Soft-wrapped rows are reproduced as terminal autowraps on the hosting terminal.
 Selecting them with the hosting terminal's copy command therefore does not
-insert a newline that was absent from the original output.
+insert a newline that was absent from the original output. Unused cells at the
+end of hard lines are erased instead of being written as spaces, so they are
+not included in the selection.
 .SH ENVIRONMENT
 .TP
 .B SHELL

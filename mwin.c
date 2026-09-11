@@ -1923,9 +1923,11 @@ static void
 append_screen_cells(struct Buffer *output, struct Screen *screen, int source_row,
                     struct Attr *previous)
 {
+	int columns = screen->wrapped[source_row] != 0 ? screen->cols :
+	              screen_row_last(screen, source_row);
 	int col;
 
-	for (col = 0; col < screen->cols; col++) {
+	for (col = 0; col < columns; col++) {
 		struct Cell *cell = cell_at(screen, source_row, col);
 		unsigned int i;
 		if (cell->width == 0)
@@ -1937,6 +1939,15 @@ append_screen_cells(struct Buffer *output, struct Screen *screen, int source_row
 		append_codepoint(output, cell->cp == 0 ? ' ' : cell->cp);
 		for (i = 0; i < cell->ncombining; i++)
 			append_codepoint(output, cell->combining[i]);
+	}
+	if (columns < screen->cols) {
+		struct Attr attr = default_attr();
+
+		if (!attr_equal(*previous, attr)) {
+			append_attr(output, attr);
+			*previous = attr;
+		}
+		(void)output_append(output, "\033[K");
 	}
 }
 
@@ -2030,10 +2041,13 @@ append_history_cells(struct Buffer *output, const struct HistoryLine *line,
 		append_attr(output, current);
 		*previous = current;
 	}
-	while (column < columns) {
-		(void)buffer_append(output, " ", 1);
-		column++;
-	}
+	if (line != NULL && line->wrapped)
+		while (column < columns) {
+			(void)buffer_append(output, " ", 1);
+			column++;
+		}
+	else if (column < columns)
+		(void)output_append(output, "\033[K");
 }
 
 static const struct HistoryLine *

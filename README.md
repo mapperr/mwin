@@ -146,7 +146,8 @@ Mwin reproduces soft-wrapped boundaries as real autowraps in the hosting
 terminal. Consequently, selecting a wrapped logical line with foot's
 `Ctrl-Shift-c` (or the equivalent shortcut in another terminal) copies it
 without inserting a newline at the visual wrap point. Explicit newlines remain
-newlines.
+newlines. Unused cells at the end of a hard line are erased rather than written
+as spaces, so they are not included in the selection.
 
 Rows are stored compactly as UTF-8 plus style changes. They are allocated only
 as output scrolls. The only limit is the number of rows:
