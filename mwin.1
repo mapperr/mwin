@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.3.8" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.9" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -135,6 +135,29 @@ Shell used for new windows. The user's login shell and /bin/sh are fallbacks.
 .TP
 .B EDITOR
 Editor command used to open scrollback snapshots. The default is vi.
+.TP
+.B MWIN_PREFIX
+Command prefix. The value uses the same syntax as
+.BR -c ;
+the command-line option takes precedence. The default is Ctrl-o.
+.TP
+.B MWIN_KEY_*
+Command binding variables: MWIN_KEY_NEW, MWIN_KEY_LAST, MWIN_KEY_NEXT,
+MWIN_KEY_PREV, MWIN_KEY_CLOSE, MWIN_KEY_REDRAW, MWIN_KEY_SCROLLBACK,
+MWIN_KEY_EDITOR, MWIN_KEY_HELP, and MWIN_KEY_WINDOW_1 through
+MWIN_KEY_WINDOW_10.
+.TP
+.B MWIN_SCROLL_*
+Scrollback binding variables: MWIN_SCROLL_HALF_BACK,
+MWIN_SCROLL_HALF_FORWARD, MWIN_SCROLL_PAGE_BACK, MWIN_SCROLL_PAGE_FORWARD,
+MWIN_SCROLL_LINE_BACK, MWIN_SCROLL_LINE_FORWARD, MWIN_SCROLL_EDITOR,
+MWIN_SCROLL_OLDEST, MWIN_SCROLL_LIVE, and MWIN_SCROLL_ESCAPE.
+.PP
+Each binding value is one literal byte, a caret form such as ^U, or a decimal
+value from 0 through 255. Unset variables retain the keys documented above.
+Duplicate keys within the same mode are rejected; command and scrollback keys
+may overlap. The prefix takes precedence if it overlaps a binding. Pressing the
+configured prefix twice sends it to the child.
 .TP
 .B MWIN_SCROLLBACK
 Maximum number of scrollback rows retained independently for each window.

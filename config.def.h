@@ -1,7 +1,7 @@
 #ifndef MWIN_CONFIG_H
 #define MWIN_CONFIG_H
 
-/* Ctrl-key used as the mwin command prefix. */
+/* Default command prefix; MWIN_PREFIX and -c override it. */
 #define COMMAND_KEY 'o'
 
 /* One screen row is reserved for the window list when non-zero. */

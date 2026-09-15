@@ -25,6 +25,18 @@ CTRL_O = b"\x0f"
 VERSION = next(line.split("=", 1)[1].strip()
                for line in (ROOT / "Makefile").read_text().splitlines()
                if line.startswith("VERSION ="))
+KEY_ENVIRONMENT = (
+    "MWIN_PREFIX",
+    "MWIN_KEY_NEW", "MWIN_KEY_LAST", "MWIN_KEY_NEXT", "MWIN_KEY_PREV",
+    "MWIN_KEY_CLOSE", "MWIN_KEY_REDRAW", "MWIN_KEY_SCROLLBACK",
+    "MWIN_KEY_EDITOR", "MWIN_KEY_HELP",
+    *("MWIN_KEY_WINDOW_%d" % number for number in range(1, 11)),
+    "MWIN_SCROLL_HALF_BACK", "MWIN_SCROLL_HALF_FORWARD",
+    "MWIN_SCROLL_PAGE_BACK", "MWIN_SCROLL_PAGE_FORWARD",
+    "MWIN_SCROLL_LINE_BACK", "MWIN_SCROLL_LINE_FORWARD",
+    "MWIN_SCROLL_EDITOR", "MWIN_SCROLL_OLDEST", "MWIN_SCROLL_LIVE",
+    "MWIN_SCROLL_ESCAPE",
+)
 
 
 class HostScreen:
@@ -40,6 +52,7 @@ class HostScreen:
         self.rows = rows
         self.columns = columns
         self.cells = [[" "] * columns for _ in range(rows)]
+        self.occupied = [[False] * columns for _ in range(rows)]
         self.wrapped = [False] * rows
         self.row = 0
         self.column = 0
@@ -59,7 +72,11 @@ class HostScreen:
     def logical_text(self, first, last):
         result = []
         for row in range(first, last + 1):
-            result.append(self.line(row))
+            used = 0
+            for column, occupied in enumerate(self.occupied[row]):
+                if occupied:
+                    used = column + 1
+            result.append("".join(self.cells[row][:used]))
             if row < last and not self.wrapped[row]:
                 result.append("\n")
         return "".join(result)
@@ -70,6 +87,8 @@ class HostScreen:
             return
         self.cells.pop(0)
         self.cells.append([" "] * self.columns)
+        self.occupied.pop(0)
+        self.occupied.append([False] * self.columns)
         self.wrapped.pop(0)
         self.wrapped.append(False)
 
@@ -81,6 +100,7 @@ class HostScreen:
                 self.column = 0
             self.wrap_pending = False
         self.cells[self.row][self.column] = chr(byte)
+        self.occupied[self.row][self.column] = True
         if self.column + 1 == self.columns:
             self.wrap_pending = True
         else:
@@ -108,7 +128,13 @@ class HostScreen:
             self.wrap_pending = False
         elif final == "J" and self._number(fields[0], 0) in (2, 3):
             self.cells = [[" "] * self.columns for _ in range(self.rows)]
+            self.occupied = [[False] * self.columns for _ in range(self.rows)]
             self.wrapped = [False] * self.rows
+            self.wrap_pending = False
+        elif final == "K" and (not fields or self._number(fields[0], 0) == 0):
+            for column in range(self.column, self.columns):
+                self.cells[self.row][column] = " "
+                self.occupied[self.row][column] = False
             self.wrap_pending = False
         elif private and final in ("h", "l"):
             enabled = final == "h"
@@ -117,6 +143,8 @@ class HostScreen:
                     self.autowrap = enabled
                 elif field == "1049" and enabled:
                     self.cells = [[" "] * self.columns for _ in range(self.rows)]
+                    self.occupied = [[False] * self.columns
+                                     for _ in range(self.rows)]
                     self.wrapped = [False] * self.rows
                     self.row = 0
                     self.column = 0
@@ -175,6 +203,8 @@ class MwinSession:
         self._set_size(rows, columns)
         self.original_termios = termios.tcgetattr(master)
         env = os.environ.copy()
+        for name in KEY_ENVIRONMENT:
+            env.pop(name, None)
         env.setdefault("LC_ALL", "C")
         if environment:
             env.update(environment)
@@ -278,6 +308,8 @@ class MwinSession:
 class CommandLineTests(unittest.TestCase):
     def run_mwin(self, *arguments, environment=None):
         env = os.environ.copy()
+        for name in KEY_ENVIRONMENT:
+            env.pop(name, None)
         if environment:
             env.update(environment)
         return subprocess.run(
@@ -304,6 +336,20 @@ class CommandLineTests(unittest.TestCase):
         result = self.run_mwin("-z")
         self.assertEqual(result.returncode, 2)
         self.assertIn(b"usage: mwin", result.stderr)
+
+    def test_invalid_environment_keys_and_collisions(self):
+        for name in KEY_ENVIRONMENT:
+            with self.subTest(name=name):
+                result = self.run_mwin(environment={name: "invalid"})
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(name.encode("ascii"), result.stderr)
+
+        result = self.run_mwin(environment={
+            "MWIN_KEY_NEW": "x",
+            "MWIN_KEY_LAST": "x",
+        })
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"use the same key", result.stderr)
 
     def test_invalid_scrollback_limits(self):
         for value in ("", "invalid", "-1", " 5", "5x", "9" * 80):
@@ -360,14 +406,23 @@ class TerminalInterfaceTests(unittest.TestCase):
 
     def test_alternate_prefix(self):
         environment = {"MWIN_PROBE_BYTES": "1"}
-        with MwinSession(["-c", "^G", sys.executable, PROBE, "input"],
-                         rows=8, columns=80, environment=environment,
-                         prefix=b"\x07") as session:
-            session.wait_status("[1:READY]")
-            session.send(b"\x07")
-            session.wait_status("prefix ^G: waiting for key")
-            session.send(b"\x07")
-            session.wait_status("[1:HEX-07]")
+        cases = (
+            (["-c", "^G"], {}, b"\x07", "^G", "07"),
+            ([], {"MWIN_PREFIX": "^G"}, b"\x07", "^G", "07"),
+            (["-c", "^O"], {"MWIN_PREFIX": "^G"}, CTRL_O, "^O", "0f"),
+        )
+        for arguments, extra, prefix, label, received in cases:
+            with self.subTest(arguments=arguments, environment=extra):
+                current_environment = {**environment, **extra}
+                with MwinSession([*arguments, sys.executable, PROBE, "input"],
+                                 rows=8, columns=80,
+                                 environment=current_environment,
+                                 prefix=prefix) as session:
+                    session.wait_status("[1:READY]")
+                    session.send(prefix)
+                    session.wait_status("prefix %s: waiting for key" % label)
+                    session.send(prefix)
+                    session.wait_status("[1:HEX-%s]" % received)
 
     def test_literal_and_decimal_prefixes(self):
         cases = (("g", b"g", "prefix g: waiting for key", "67"),
@@ -450,58 +505,129 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.command(b"\x18")
             self.assertEqual(session.wait_exit(), 0)
 
-    def test_direct_selection_of_window_ten(self):
+    def test_custom_command_bindings(self):
+        environment = {
+            "SHELL": "/bin/sh",
+            "MWIN_PREFIX": "^G",
+            "MWIN_KEY_NEW": "n",
+            "MWIN_KEY_LAST": "l",
+            "MWIN_KEY_NEXT": "]",
+            "MWIN_KEY_PREV": "[",
+            "MWIN_KEY_CLOSE": "x",
+            "MWIN_KEY_REDRAW": "r",
+            "MWIN_KEY_SCROLLBACK": "s",
+            "MWIN_KEY_EDITOR": "v",
+            "MWIN_KEY_HELP": "h",
+            "MWIN_KEY_WINDOW_1": "a",
+        }
         with MwinSession(["sleep", "30"], rows=8, columns=180,
-                         environment={"SHELL": "/bin/sh"}) as session:
+                         environment=environment, prefix=b"\x07") as session:
             session.wait_status("[1:sleep]")
-            for number in range(2, 11):
-                session.command(b"m")
-                session.wait_status("[%d:sh]" % number)
-            for number in range(1, 10):
-                session.command(str(number).encode("ascii"))
-                title = "sleep" if number == 1 else "sh"
-                session.wait_status("[%d:%s]" % (number, title))
-            session.command(b"0")
-            session.wait_status("[10:sh]")
+            session.command(b"n")
+            session.wait_status("[2:sh]")
+            session.command(b"[")
+            session.wait_status("[1:sleep]")
+            session.command(b"]")
+            session.wait_status("[2:sh]")
+            session.command(b"a")
+            session.wait_status("[1:sleep]")
+            session.command(b"l")
+            session.wait_status("[2:sh]")
+            session.command(b"h")
+            session.wait_status("^G n:new")
+            self.assertIn("v:editor", session.screen.line(7))
+            session.send(b"z")
+            session.wait_status("[2:sh]")
+            start = len(session.transcript)
+            session.command(b"r")
+            session.wait_for(lambda: b"\033[2J" in session.transcript[start:],
+                             "custom redraw")
+            session.command(b"x")
+            session.wait_status("[1:sleep]")
+            session.command(b"x")
+            self.assertEqual(session.wait_exit(), 0)
+
+    def test_direct_selection_of_window_ten(self):
+        cases = ((b"1234567890", {}), (b"abcdefghij", {
+            "MWIN_KEY_WINDOW_%d" % number: chr(ord("a") + number - 1)
+            for number in range(1, 11)
+        }))
+        for keys, extra in cases:
+            with self.subTest(custom=bool(extra)):
+                environment = {"SHELL": "/bin/sh", **extra}
+                with MwinSession(["sleep", "30"], rows=8, columns=180,
+                                 environment=environment) as session:
+                    session.wait_status("[1:sleep]")
+                    for number in range(2, 11):
+                        session.command(b"m")
+                        session.wait_status("[%d:sh]" % number)
+                    for number, key in enumerate(keys, 1):
+                        session.command(bytes((key,)))
+                        title = "sleep" if number == 1 else "sh"
+                        session.wait_status("[%d:%s]" % (number, title))
 
     def test_scrollback_navigation_and_limit(self):
-        with self.probe("lines", rows=6, columns=60,
-                        environment={"MWIN_SCROLLBACK": "5"}) as session:
-            session.wait_for(lambda: session.screen.lines(0, 4) ==
-                             ["L08", "L09", "L10", "L11", "LIVE"],
-                             "live output")
-            session.command(b"\x15")
-            session.wait_status("scroll 2/5")
-            self.assertEqual(session.screen.lines(0, 4),
-                             ["L06", "L07", "L08", "L09", "L10"])
-            session.send(b"\x15")
-            session.wait_status("scroll 4/5")
-            self.assertEqual(session.screen.lines(0, 4),
-                             ["L04", "L05", "L06", "L07", "L08"])
-            session.send(b"\x02")
-            session.wait_status("scroll 5/5")
-            session.send(b"j")
-            session.wait_status("scroll 4/5")
-            session.send(b"k")
-            session.wait_status("scroll 5/5")
-            session.send(b"\x04")
-            session.wait_status("scroll 3/5")
-            session.send(b"\x06")
-            session.wait_status("[1:LINES-")
-            self.assertEqual(session.screen.lines(0, 4),
-                             ["L08", "L09", "L10", "L11", "LIVE"])
-            session.command(b"\x15")
-            session.wait_status("scroll 2/5")
-            session.send(b"g")
-            session.wait_status("scroll 5/5")
-            session.send(b"G")
-            session.wait_status("[1:LINES-")
-            session.command(b"\x15")
-            session.wait_status("scroll 2/5")
-            session.send(b"\x1b")
-            session.wait_status("[1:LINES-")
-            session.send(b"x")
-            session.wait_status("[1:HEX-78]")
+        custom = {
+            "MWIN_KEY_SCROLLBACK": "s",
+            "MWIN_SCROLL_HALF_BACK": "u",
+            "MWIN_SCROLL_HALF_FORWARD": "d",
+            "MWIN_SCROLL_PAGE_BACK": "b",
+            "MWIN_SCROLL_PAGE_FORWARD": "f",
+            "MWIN_SCROLL_LINE_BACK": "i",
+            "MWIN_SCROLL_LINE_FORWARD": "o",
+            "MWIN_SCROLL_OLDEST": "a",
+            "MWIN_SCROLL_LIVE": "z",
+            "MWIN_SCROLL_ESCAPE": "q",
+        }
+        cases = (
+            ({}, b"\x15", b"\x15", b"\x04", b"\x02", b"\x06",
+             b"k", b"j", b"g", b"G", b"\x1b"),
+            (custom, b"s", b"u", b"d", b"b", b"f",
+             b"i", b"o", b"a", b"z", b"q"),
+        )
+        for (extra, enter, half_back, half_forward, page_back, page_forward,
+             line_back, line_forward, oldest, live, escape) in cases:
+            with self.subTest(custom=bool(extra)):
+                environment = {"MWIN_SCROLLBACK": "5", **extra}
+                with self.probe("lines", rows=6, columns=60,
+                                environment=environment) as session:
+                    session.wait_for(lambda: session.screen.lines(0, 4) ==
+                                     ["L08", "L09", "L10", "L11", "LIVE"],
+                                     "live output")
+                    session.command(enter)
+                    session.wait_status("scroll 2/5")
+                    if extra:
+                        self.assertIn("u/d half", session.screen.line(5))
+                    self.assertEqual(session.screen.lines(0, 4),
+                                     ["L06", "L07", "L08", "L09", "L10"])
+                    session.send(half_back)
+                    session.wait_status("scroll 4/5")
+                    self.assertEqual(session.screen.lines(0, 4),
+                                     ["L04", "L05", "L06", "L07", "L08"])
+                    session.send(page_back)
+                    session.wait_status("scroll 5/5")
+                    session.send(line_forward)
+                    session.wait_status("scroll 4/5")
+                    session.send(line_back)
+                    session.wait_status("scroll 5/5")
+                    session.send(half_forward)
+                    session.wait_status("scroll 3/5")
+                    session.send(page_forward)
+                    session.wait_status("[1:LINES-")
+                    self.assertEqual(session.screen.lines(0, 4),
+                                     ["L08", "L09", "L10", "L11", "LIVE"])
+                    session.command(enter)
+                    session.wait_status("scroll 2/5")
+                    session.send(oldest)
+                    session.wait_status("scroll 5/5")
+                    session.send(live)
+                    session.wait_status("[1:LINES-")
+                    session.command(enter)
+                    session.wait_status("scroll 2/5")
+                    session.send(escape)
+                    session.wait_status("[1:LINES-")
+                    session.send(b"x")
+                    session.wait_status("[1:HEX-78]")
 
     def test_window_switch_preserves_scrollback_position(self):
         environment = {"MWIN_SCROLLBACK": "20", "SHELL": "/bin/sh"}
@@ -523,8 +649,14 @@ class TerminalInterfaceTests(unittest.TestCase):
     def test_edit_scrollback_with_editor(self):
         captured = b"H0\nH1\nabcdefghij\nKLMN\nEND"
         digest = hashlib.sha256(captured).hexdigest()[:16]
-        for prefixed in (False, True):
-            binding = "Ctrl-o Ctrl-e" if prefixed else "e"
+        cases = (
+            (False, b"e", {}),
+            (True, b"\x05", {}),
+            (False, b"v", {"MWIN_SCROLL_EDITOR": "v"}),
+            (True, b"\x16", {"MWIN_KEY_EDITOR": "^V"}),
+        )
+        for prefixed, key, extra in cases:
+            binding = ("prefixed " if prefixed else "scroll ") + repr(key)
             with self.subTest(binding=binding), \
                     tempfile.TemporaryDirectory() as directory:
                 marker = Path(directory) / "editor-path"
@@ -532,12 +664,13 @@ class TerminalInterfaceTests(unittest.TestCase):
                     "EDITOR": "%s %s editor" % (sys.executable, PROBE),
                     "MWIN_PROBE_MARKER": str(marker),
                     "MWIN_SCROLLBACK": "20",
+                    **extra,
                 }
                 with self.probe("capture", rows=6, columns=4,
                                 environment=environment) as session:
                     session.wait_text("END")
                     if prefixed:
-                        session.command(b"\x05")
+                        session.command(key)
                     else:
                         session.command(b"\x15")
                         session.wait_for(
@@ -545,7 +678,7 @@ class TerminalInterfaceTests(unittest.TestCase):
                             ["H0", "H1", "abcd", "efgh", "ij"],
                             "scrollback viewport",
                         )
-                        session.send(b"e")
+                        session.send(key)
                     session.wait_for(marker.exists, "editor temporary path")
                     session.resize(6, 80)
                     session.wait_status("[2:EDITOR-%s]" % digest)

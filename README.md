@@ -163,12 +163,62 @@ The default is 2000 rows per window and can be changed in `config.h`.
 
 - `SHELL`: shell created by `Ctrl-o m`; falls back to the login shell and then
   `/bin/sh`.
-- `EDITOR`: command used by `e` or `Ctrl-o Ctrl-e`; defaults to `vi`.
+- `EDITOR`: command used by the editor bindings; defaults to `vi`.
 - `MWIN_SCROLLBACK`: maximum retained rows per window; defaults to 2000 and
   accepts `0` to disable history.
 - `TERM`: describes the hosting terminal. Children receive the value configured
   as `CHILD_TERM`, `screen-256color` by default.
 - `MWIN`: set to `1` in child processes.
+
+### Configurable keys
+
+Every binding can be overridden independently. Values use the same syntax as
+`-c`: one literal byte, caret notation such as `^U`, or a decimal value from 0
+through 255. Bindings are deliberately limited to one byte; key sequences and
+modifier names are not interpreted.
+
+Unset variables retain the defaults shown below. `-c` takes precedence over
+`MWIN_PREFIX`.
+
+| Variable | Default | Action |
+| --- | --- | --- |
+| `MWIN_PREFIX` | `^O` | begin a window command |
+| `MWIN_KEY_NEW` | `m` | create a shell window |
+| `MWIN_KEY_LAST` | `o` | visit the previous window |
+| `MWIN_KEY_NEXT` | `^N` | select the next window |
+| `MWIN_KEY_PREV` | `^P` | select the previous window |
+| `MWIN_KEY_CLOSE` | `^X` | close the current window |
+| `MWIN_KEY_REDRAW` | `^L` | redraw |
+| `MWIN_KEY_SCROLLBACK` | `^U` | enter scrollback |
+| `MWIN_KEY_EDITOR` | `^E` | open scrollback in the editor |
+| `MWIN_KEY_HELP` | `?` | show the key summary |
+| `MWIN_KEY_WINDOW_1` … `MWIN_KEY_WINDOW_10` | `1` … `9`, `0` | select a numbered window |
+| `MWIN_SCROLL_HALF_BACK` | `^U` | half a page backward |
+| `MWIN_SCROLL_HALF_FORWARD` | `^D` | half a page forward |
+| `MWIN_SCROLL_PAGE_BACK` | `^B` | one page backward |
+| `MWIN_SCROLL_PAGE_FORWARD` | `^F` | one page forward |
+| `MWIN_SCROLL_LINE_BACK` | `k` | one row backward |
+| `MWIN_SCROLL_LINE_FORWARD` | `j` | one row forward |
+| `MWIN_SCROLL_EDITOR` | `e` | open scrollback in the editor |
+| `MWIN_SCROLL_OLDEST` | `g` | oldest retained row |
+| `MWIN_SCROLL_LIVE` | `G` | live terminal |
+| `MWIN_SCROLL_ESCAPE` | `27` | live terminal |
+
+For example:
+
+```sh
+MWIN_PREFIX='^G' \
+MWIN_KEY_NEW='n' \
+MWIN_SCROLL_LINE_BACK='u' \
+MWIN_SCROLL_LINE_FORWARD='d' \
+mwin
+```
+
+Two actions may share a byte when they belong to different modes. Duplicate
+keys within the command mode or within scrollback are rejected at startup.
+The prefix itself may overlap a binding for compatibility with `-c`; it takes
+precedence, making that binding unreachable. Pressing the configured prefix
+twice always sends that byte to the child.
 
 ## Intentional limits
 

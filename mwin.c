@@ -57,6 +57,82 @@
 static const unsigned char paste_begin[] = "\033[200~";
 static const unsigned char paste_end[] = "\033[201~";
 
+enum BindingScope {
+	SCOPE_COMMAND,
+	SCOPE_SCROLLBACK
+};
+
+enum BindingId {
+	KEY_NEW,
+	KEY_LAST,
+	KEY_NEXT,
+	KEY_PREV,
+	KEY_CLOSE,
+	KEY_REDRAW,
+	KEY_SCROLLBACK,
+	KEY_EDITOR,
+	KEY_HELP,
+	KEY_WINDOW_1,
+	KEY_WINDOW_2,
+	KEY_WINDOW_3,
+	KEY_WINDOW_4,
+	KEY_WINDOW_5,
+	KEY_WINDOW_6,
+	KEY_WINDOW_7,
+	KEY_WINDOW_8,
+	KEY_WINDOW_9,
+	KEY_WINDOW_10,
+	SCROLL_HALF_BACK,
+	SCROLL_HALF_FORWARD,
+	SCROLL_PAGE_BACK,
+	SCROLL_PAGE_FORWARD,
+	SCROLL_LINE_BACK,
+	SCROLL_LINE_FORWARD,
+	SCROLL_EDITOR,
+	SCROLL_OLDEST,
+	SCROLL_LIVE,
+	SCROLL_ESCAPE,
+	BINDING_COUNT
+};
+
+struct KeyBinding {
+	const char *environment;
+	unsigned char key;
+	enum BindingScope scope;
+};
+
+static struct KeyBinding bindings[BINDING_COUNT] = {
+	[KEY_NEW]             = {"MWIN_KEY_NEW",             'm',            SCOPE_COMMAND},
+	[KEY_LAST]            = {"MWIN_KEY_LAST",            'o',            SCOPE_COMMAND},
+	[KEY_NEXT]            = {"MWIN_KEY_NEXT",            MWIN_CTRL('n'), SCOPE_COMMAND},
+	[KEY_PREV]            = {"MWIN_KEY_PREV",            MWIN_CTRL('p'), SCOPE_COMMAND},
+	[KEY_CLOSE]           = {"MWIN_KEY_CLOSE",           MWIN_CTRL('x'), SCOPE_COMMAND},
+	[KEY_REDRAW]          = {"MWIN_KEY_REDRAW",          MWIN_CTRL('l'), SCOPE_COMMAND},
+	[KEY_SCROLLBACK]      = {"MWIN_KEY_SCROLLBACK",      MWIN_CTRL('u'), SCOPE_COMMAND},
+	[KEY_EDITOR]          = {"MWIN_KEY_EDITOR",          MWIN_CTRL('e'), SCOPE_COMMAND},
+	[KEY_HELP]            = {"MWIN_KEY_HELP",            '?',            SCOPE_COMMAND},
+	[KEY_WINDOW_1]        = {"MWIN_KEY_WINDOW_1",        '1',            SCOPE_COMMAND},
+	[KEY_WINDOW_2]        = {"MWIN_KEY_WINDOW_2",        '2',            SCOPE_COMMAND},
+	[KEY_WINDOW_3]        = {"MWIN_KEY_WINDOW_3",        '3',            SCOPE_COMMAND},
+	[KEY_WINDOW_4]        = {"MWIN_KEY_WINDOW_4",        '4',            SCOPE_COMMAND},
+	[KEY_WINDOW_5]        = {"MWIN_KEY_WINDOW_5",        '5',            SCOPE_COMMAND},
+	[KEY_WINDOW_6]        = {"MWIN_KEY_WINDOW_6",        '6',            SCOPE_COMMAND},
+	[KEY_WINDOW_7]        = {"MWIN_KEY_WINDOW_7",        '7',            SCOPE_COMMAND},
+	[KEY_WINDOW_8]        = {"MWIN_KEY_WINDOW_8",        '8',            SCOPE_COMMAND},
+	[KEY_WINDOW_9]        = {"MWIN_KEY_WINDOW_9",        '9',            SCOPE_COMMAND},
+	[KEY_WINDOW_10]       = {"MWIN_KEY_WINDOW_10",       '0',            SCOPE_COMMAND},
+	[SCROLL_HALF_BACK]    = {"MWIN_SCROLL_HALF_BACK",    MWIN_CTRL('u'), SCOPE_SCROLLBACK},
+	[SCROLL_HALF_FORWARD] = {"MWIN_SCROLL_HALF_FORWARD", MWIN_CTRL('d'), SCOPE_SCROLLBACK},
+	[SCROLL_PAGE_BACK]    = {"MWIN_SCROLL_PAGE_BACK",    MWIN_CTRL('b'), SCOPE_SCROLLBACK},
+	[SCROLL_PAGE_FORWARD] = {"MWIN_SCROLL_PAGE_FORWARD", MWIN_CTRL('f'), SCOPE_SCROLLBACK},
+	[SCROLL_LINE_BACK]    = {"MWIN_SCROLL_LINE_BACK",    'k',            SCOPE_SCROLLBACK},
+	[SCROLL_LINE_FORWARD] = {"MWIN_SCROLL_LINE_FORWARD", 'j',            SCOPE_SCROLLBACK},
+	[SCROLL_EDITOR]       = {"MWIN_SCROLL_EDITOR",       'e',            SCOPE_SCROLLBACK},
+	[SCROLL_OLDEST]       = {"MWIN_SCROLL_OLDEST",       'g',            SCOPE_SCROLLBACK},
+	[SCROLL_LIVE]         = {"MWIN_SCROLL_LIVE",         'G',            SCOPE_SCROLLBACK},
+	[SCROLL_ESCAPE]       = {"MWIN_SCROLL_ESCAPE",       '\033',         SCOPE_SCROLLBACK}
+};
+
 enum {
 	ATTR_BOLD      = 1u << 0,
 	ATTR_DIM       = 1u << 1,
@@ -2117,6 +2193,8 @@ append_viewport(struct Buffer *output, struct Terminal *terminal)
 static const char *
 key_text(unsigned char key, char text[4])
 {
+	if (key == '\033')
+		return "Esc";
 	if (key < 32) {
 		text[0] = '^';
 		text[1] = (char)(key + '@');
@@ -2125,12 +2203,37 @@ key_text(unsigned char key, char text[4])
 	}
 	if (key == 127)
 		return "^?";
-	if (isprint(key)) {
+	if (key == ' ')
+		return "SPC";
+	if (key < 127) {
 		text[0] = (char)key;
 		text[1] = '\0';
 		return text;
 	}
-	return "?";
+	(void)snprintf(text, 4, "%u", (unsigned int)key);
+	return text;
+}
+
+static void
+append_binding_text(struct Buffer *output, const char *before,
+                    enum BindingId binding, const char *after)
+{
+	char key[4];
+
+	(void)output_printf(output, "%s%s%s", before,
+	                    key_text(bindings[binding].key, key), after);
+}
+
+static void
+append_binding_pair(struct Buffer *output, enum BindingId first,
+                    enum BindingId second, const char *after)
+{
+	char first_key[4];
+	char second_key[4];
+
+	(void)output_printf(output, "  %s/%s%s",
+	                    key_text(bindings[first].key, first_key),
+	                    key_text(bindings[second].key, second_key), after);
 }
 
 static void
@@ -2163,10 +2266,20 @@ append_status(struct Buffer *output)
 		const char *title = windows[active_window]->title[0] == '\0' ?
 		                    "shell" : windows[active_window]->title;
 		output_printf(&status,
-		              "[%zu:%s] scroll %zu/%zu  ^U/^D half  ^B/^F page  k/j line  e editor  g/G oldest/live  Esc live",
+		              "[%zu:%s] scroll %zu/%zu",
 		              active_window + 1, title,
 		              windows[active_window]->scroll_offset,
 		              windows[active_window]->history.count);
+		append_binding_pair(&status, SCROLL_HALF_BACK,
+		                    SCROLL_HALF_FORWARD, " half");
+		append_binding_pair(&status, SCROLL_PAGE_BACK,
+		                    SCROLL_PAGE_FORWARD, " page");
+		append_binding_pair(&status, SCROLL_LINE_BACK,
+		                    SCROLL_LINE_FORWARD, " line");
+		append_binding_text(&status, "  ", SCROLL_EDITOR, " editor");
+		append_binding_pair(&status, SCROLL_OLDEST,
+		                    SCROLL_LIVE, " oldest/live");
+		append_binding_text(&status, "  ", SCROLL_ESCAPE, " live");
 	} else for (i = 0; i < window_count; i++) {
 		const char *title = windows[i]->title[0] == '\0' ? "shell" : windows[i]->title;
 		output_printf(&status, "%s%s%zu:%s%s",
@@ -2183,18 +2296,27 @@ append_status(struct Buffer *output)
 static void
 append_help(struct Buffer *output)
 {
-	char help[256];
+	struct Buffer help = {0};
 	char key[4];
-	const char *prefix_text;
-	size_t length;
+	int i;
 
-	prefix_text = key_text(command_prefix, key);
-	(void)snprintf(help, sizeof(help),
-	               " %s m:new  o:last  ^N/^P:next/prev  1-0:select  ^X:close  ^L:redraw  ^U:scroll  ^E:editor  %s:send ",
-	               prefix_text, prefix_text);
-	length = strlen(help);
-
-	append_bar(output, help, length);
+	(void)output_printf(&help, " %s", key_text(command_prefix, key));
+	append_binding_text(&help, " ", KEY_NEW, ":new");
+	append_binding_text(&help, "  ", KEY_LAST, ":last");
+	append_binding_pair(&help, KEY_NEXT, KEY_PREV, ":next/prev");
+	append_binding_text(&help, "  ", KEY_CLOSE, ":close");
+	append_binding_text(&help, "  ", KEY_REDRAW, ":redraw");
+	append_binding_text(&help, "  ", KEY_SCROLLBACK, ":scroll");
+	append_binding_text(&help, "  ", KEY_EDITOR, ":editor");
+	append_binding_text(&help, "  ", KEY_HELP, ":help");
+	(void)output_append(&help, "  ");
+	for (i = KEY_WINDOW_1; i <= KEY_WINDOW_10; i++)
+		append_binding_text(&help, i == KEY_WINDOW_1 ? "" : "/",
+		                    (enum BindingId)i, "");
+	(void)output_append(&help, ":select");
+	(void)output_printf(&help, "  %s:send ", key_text(command_prefix, key));
+	append_bar(output, (const char *)help.data, help.length);
+	buffer_free(&help);
 }
 
 static void
@@ -2760,36 +2882,47 @@ scroll_forward(struct Terminal *terminal, size_t amount)
 	render(true);
 }
 
+static enum BindingId
+binding_for(enum BindingScope scope, unsigned char byte)
+{
+	size_t i;
+
+	for (i = 0; i < BINDING_COUNT; i++)
+		if (bindings[i].scope == scope && bindings[i].key == byte)
+			return (enum BindingId)i;
+	return BINDING_COUNT;
+}
+
 static void
 handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
 {
-	switch (byte) {
-	case MWIN_CTRL('u'):
+	switch (binding_for(SCOPE_SCROLLBACK, byte)) {
+	case SCROLL_HALF_BACK:
 		scroll_backward(terminal, scroll_half_page(terminal));
 		break;
-	case MWIN_CTRL('d'):
+	case SCROLL_HALF_FORWARD:
 		scroll_forward(terminal, scroll_half_page(terminal));
 		break;
-	case MWIN_CTRL('b'):
+	case SCROLL_PAGE_BACK:
 		scroll_backward(terminal, scroll_page(terminal));
 		break;
-	case MWIN_CTRL('f'):
+	case SCROLL_PAGE_FORWARD:
 		scroll_forward(terminal, scroll_page(terminal));
 		break;
-	case 'k':
+	case SCROLL_LINE_BACK:
 		scroll_backward(terminal, 1);
 		break;
-	case 'j':
+	case SCROLL_LINE_FORWARD:
 		scroll_forward(terminal, 1);
 		break;
-	case 'e':
+	case SCROLL_EDITOR:
 		edit_scrollback();
 		break;
-	case 'g':
+	case SCROLL_OLDEST:
 		scroll_backward(terminal, terminal->history.count);
 		break;
-	case 'G':
-	case '\033':
+	case SCROLL_LIVE:
+	case SCROLL_ESCAPE:
 		scroll_to_live(terminal);
 		break;
 	default:
@@ -2800,52 +2933,51 @@ handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
 static void
 handle_command(unsigned char byte)
 {
+	enum BindingId binding;
 	size_t target;
 
 	if (byte == command_prefix) {
 		(void)buffer_append(&windows[active_window]->input, &byte, 1);
 		return;
 	}
-	switch (byte) {
-	case 'm':
+	binding = binding_for(SCOPE_COMMAND, byte);
+	if (binding >= KEY_WINDOW_1 && binding <= KEY_WINDOW_10) {
+		target = (size_t)(binding - KEY_WINDOW_1);
+		select_window(target);
+		return;
+	}
+	switch (binding) {
+	case KEY_NEW:
 		new_shell();
 		break;
-	case 'o':
+	case KEY_LAST:
 		select_previous_window();
 		break;
-	case MWIN_CTRL('n'):
+	case KEY_NEXT:
 		select_window((active_window + 1) % window_count);
 		break;
-	case MWIN_CTRL('p'):
+	case KEY_PREV:
 		select_window((active_window + window_count - 1) % window_count);
 		break;
-	case MWIN_CTRL('x'):
+	case KEY_CLOSE:
 		remove_window(active_window, true);
 		break;
-	case MWIN_CTRL('l'):
+	case KEY_REDRAW:
 		help_visible = false;
 		render(true);
 		break;
-	case MWIN_CTRL('u'):
+	case KEY_SCROLLBACK:
 		scroll_backward(windows[active_window],
 		                scroll_half_page(windows[active_window]));
 		break;
-	case MWIN_CTRL('e'):
+	case KEY_EDITOR:
 		edit_scrollback();
 		break;
-	case '?':
+	case KEY_HELP:
 		help_visible = true;
 		render(false);
 		break;
-	case '0':
-		target = 9;
-		select_window(target);
-		break;
 	default:
-		if (byte >= '1' && byte <= '9') {
-			target = (size_t)(byte - '1');
-			select_window(target);
-		}
 		break;
 	}
 }
@@ -3195,7 +3327,7 @@ fatal(const char *message)
 }
 
 static unsigned char
-parse_key(const char *text)
+parse_key(const char *text, const char *source)
 {
 	char *end;
 	long value;
@@ -3204,12 +3336,39 @@ parse_key(const char *text)
 		return MWIN_CTRL((unsigned char)toupper((unsigned char)text[1]));
 	if (text[0] != '\0' && text[1] == '\0')
 		return (unsigned char)text[0];
-	errno = 0;
-	value = strtol(text, &end, 10);
-	if (errno == 0 && *end == '\0' && value >= 0 && value <= 255)
-		return (unsigned char)value;
-	fprintf(stderr, "mwin: invalid command key: %s\n", text);
+	if (text[0] != '\0') {
+		errno = 0;
+		value = strtol(text, &end, 10);
+		if (errno == 0 && *end == '\0' && value >= 0 && value <= 255)
+			return (unsigned char)value;
+	}
+	fprintf(stderr, "mwin: invalid key for %s: %s\n", source, text);
 	exit(2);
+}
+
+static void
+bindings_from_environment(void)
+{
+	const char *text = getenv("MWIN_PREFIX");
+	size_t i;
+	size_t j;
+
+	if (text != NULL)
+		command_prefix = parse_key(text, "MWIN_PREFIX");
+	for (i = 0; i < BINDING_COUNT; i++) {
+		text = getenv(bindings[i].environment);
+		if (text != NULL)
+			bindings[i].key = parse_key(text, bindings[i].environment);
+	}
+	for (i = 0; i < BINDING_COUNT; i++)
+		for (j = i + 1; j < BINDING_COUNT; j++)
+			if (bindings[i].scope == bindings[j].scope &&
+			    bindings[i].key == bindings[j].key) {
+				fprintf(stderr, "mwin: %s and %s use the same key\n",
+				        bindings[i].environment,
+				        bindings[j].environment);
+				exit(2);
+			}
 }
 
 static size_t
@@ -3252,6 +3411,8 @@ main(int argc, char **argv)
 {
 	char *initial_shell[2];
 	char **initial_command;
+	unsigned char option_prefix = 0;
+	bool have_option_prefix = false;
 	int option;
 
 	(void)setlocale(LC_CTYPE, "");
@@ -3262,7 +3423,8 @@ main(int argc, char **argv)
 	while ((option = getopt(argc, argv, "+c:shv")) != -1) {
 		switch (option) {
 		case 'c':
-			command_prefix = parse_key(optarg);
+			option_prefix = parse_key(optarg, "-c");
+			have_option_prefix = true;
 			break;
 		case 's':
 			status_enabled = false;
@@ -3278,6 +3440,9 @@ main(int argc, char **argv)
 			return 2;
 		}
 	}
+	bindings_from_environment();
+	if (have_option_prefix)
+		command_prefix = option_prefix;
 	if (command_prefix == 0) {
 		fprintf(stderr, "mwin: NUL cannot be used as the command key\n");
 		return 2;
