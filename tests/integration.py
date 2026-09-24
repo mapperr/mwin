@@ -27,7 +27,8 @@ VERSION = next(line.split("=", 1)[1].strip()
                if line.startswith("VERSION ="))
 KEY_ENVIRONMENT = (
     "MWIN_PREFIX",
-    "MWIN_KEY_NEW", "MWIN_KEY_LAST", "MWIN_KEY_NEXT", "MWIN_KEY_PREV",
+    "MWIN_KEY_NEW", "MWIN_KEY_NEW_CWD", "MWIN_KEY_LAST",
+    "MWIN_KEY_NEXT", "MWIN_KEY_PREV",
     "MWIN_KEY_CLOSE", "MWIN_KEY_REDRAW", "MWIN_KEY_SCROLLBACK",
     "MWIN_KEY_EDITOR", "MWIN_KEY_HELP",
     *("MWIN_KEY_WINDOW_%d" % number for number in range(1, 11)),
@@ -505,11 +506,37 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.command(b"\x18")
             self.assertEqual(session.wait_exit(), 0)
 
+    def test_new_window_can_inherit_the_current_directory(self):
+        cases = ((b"M", {}), (b"N", {"MWIN_KEY_NEW_CWD": "N"}))
+        for key, extra in cases:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                environment = {"SHELL": "/bin/sh", **extra}
+                with MwinSession(["/bin/sh"], rows=8, columns=100,
+                                 environment=environment) as session:
+                    session.wait_status("[1:sh]")
+                    command = "%s %s cwd %s\r" % (sys.executable, PROBE,
+                                                    directory)
+                    session.send(command.encode("ascii"))
+                    session.wait_status("[1:CWD-READY]")
+
+                    session.command(b"m")
+                    session.wait_status("[2:sh]")
+                    session.send(b"pwd\r")
+                    session.wait_text(str(ROOT))
+                    session.command(b"\x18")
+                    session.wait_status("[1:CWD-READY]")
+
+                    session.command(key)
+                    session.wait_status("[2:sh]")
+                    session.send(b"pwd\r")
+                    session.wait_text(directory)
+
     def test_custom_command_bindings(self):
         environment = {
             "SHELL": "/bin/sh",
             "MWIN_PREFIX": "^G",
             "MWIN_KEY_NEW": "n",
+            "MWIN_KEY_NEW_CWD": "N",
             "MWIN_KEY_LAST": "l",
             "MWIN_KEY_NEXT": "]",
             "MWIN_KEY_PREV": "[",
@@ -535,6 +562,7 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.wait_status("[2:sh]")
             session.command(b"h")
             session.wait_status("^G n:new")
+            self.assertIn("N:here", session.screen.line(7))
             self.assertIn("v:editor", session.screen.line(7))
             session.send(b"z")
             session.wait_status("[2:sh]")

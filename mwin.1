@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.3.9" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.10" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -41,6 +41,12 @@ by default.
 .TP
 .B m
 Create a shell window.
+.TP
+.B M
+Create a shell window in the working directory of the current window's
+foreground process. This command requires Linux procfs. If that process cannot
+be inspected, mwin tries the window's main process; if neither directory can
+be opened, no window is created and the terminal bell is rung.
 .TP
 .B o
 Return to the previously visited window. Repeated commands toggle between the
@@ -142,10 +148,10 @@ Command prefix. The value uses the same syntax as
 the command-line option takes precedence. The default is Ctrl-o.
 .TP
 .B MWIN_KEY_*
-Command binding variables: MWIN_KEY_NEW, MWIN_KEY_LAST, MWIN_KEY_NEXT,
-MWIN_KEY_PREV, MWIN_KEY_CLOSE, MWIN_KEY_REDRAW, MWIN_KEY_SCROLLBACK,
-MWIN_KEY_EDITOR, MWIN_KEY_HELP, and MWIN_KEY_WINDOW_1 through
-MWIN_KEY_WINDOW_10.
+Command binding variables: MWIN_KEY_NEW, MWIN_KEY_NEW_CWD, MWIN_KEY_LAST,
+MWIN_KEY_NEXT, MWIN_KEY_PREV, MWIN_KEY_CLOSE, MWIN_KEY_REDRAW,
+MWIN_KEY_SCROLLBACK, MWIN_KEY_EDITOR, MWIN_KEY_HELP, and MWIN_KEY_WINDOW_1
+through MWIN_KEY_WINDOW_10.
 .TP
 .B MWIN_SCROLL_*
 Scrollback binding variables: MWIN_SCROLL_HALF_BACK,

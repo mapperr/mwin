@@ -64,6 +64,7 @@ enum BindingScope {
 
 enum BindingId {
 	KEY_NEW,
+	KEY_NEW_CWD,
 	KEY_LAST,
 	KEY_NEXT,
 	KEY_PREV,
@@ -103,6 +104,7 @@ struct KeyBinding {
 
 static struct KeyBinding bindings[BINDING_COUNT] = {
 	[KEY_NEW]             = {"MWIN_KEY_NEW",             'm',            SCOPE_COMMAND},
+	[KEY_NEW_CWD]         = {"MWIN_KEY_NEW_CWD",         'M',            SCOPE_COMMAND},
 	[KEY_LAST]            = {"MWIN_KEY_LAST",            'o',            SCOPE_COMMAND},
 	[KEY_NEXT]            = {"MWIN_KEY_NEXT",            MWIN_CTRL('n'), SCOPE_COMMAND},
 	[KEY_PREV]            = {"MWIN_KEY_PREV",            MWIN_CTRL('p'), SCOPE_COMMAND},
@@ -2302,6 +2304,7 @@ append_help(struct Buffer *output)
 
 	(void)output_printf(&help, " %s", key_text(command_prefix, key));
 	append_binding_text(&help, " ", KEY_NEW, ":new");
+	append_binding_text(&help, "  ", KEY_NEW_CWD, ":here");
 	append_binding_text(&help, "  ", KEY_LAST, ":last");
 	append_binding_pair(&help, KEY_NEXT, KEY_PREV, ":next/prev");
 	append_binding_text(&help, "  ", KEY_CLOSE, ":close");
@@ -2583,7 +2586,7 @@ base_name(const char *path)
 }
 
 static struct Terminal *
-spawn_terminal(char *const argv[])
+spawn_terminal(char *const argv[], int directory_fd)
 {
 	struct Terminal *terminal;
 	struct winsize size;
@@ -2641,6 +2644,15 @@ spawn_terminal(char *const argv[])
 		(void)sigemptyset(&action.sa_mask);
 		for (i = 0; i < LEN(signals); i++)
 			(void)sigaction(signals[i], &action, NULL);
+		if (directory_fd >= 0) {
+			if (fchdir(directory_fd) < 0) {
+				(void)dprintf(STDERR_FILENO,
+				              "mwin: cannot enter inherited directory: %s\r\n",
+				              strerror(errno));
+				_exit(126);
+			}
+			close(directory_fd);
+		}
 		(void)setenv("TERM", CHILD_TERM, 1);
 		(void)setenv("MWIN", "1", 1);
 		execvp(argv[0], argv);
@@ -2681,13 +2693,18 @@ spawn_terminal(char *const argv[])
 }
 
 static bool
-add_window(char *const argv[])
+add_window(char *const argv[], int directory_fd)
 {
 	struct Terminal *terminal;
 
-	if (window_count >= MAX_WINDOWS)
+	if (window_count >= MAX_WINDOWS) {
+		if (directory_fd >= 0)
+			close(directory_fd);
 		return false;
-	terminal = spawn_terminal(argv);
+	}
+	terminal = spawn_terminal(argv, directory_fd);
+	if (directory_fd >= 0)
+		close(directory_fd);
 	if (terminal == NULL)
 		return false;
 	if (window_count != 0)
@@ -2801,15 +2818,55 @@ select_previous_window(void)
 		render(true);
 }
 
+static int
+open_process_directory(pid_t pid)
+{
+	char path[64];
+	int length;
+
+	if (pid <= 0)
+		return -1;
+	length = snprintf(path, sizeof(path), "/proc/%ld/cwd", (long)pid);
+	if (length < 0 || (size_t)length >= sizeof(path))
+		return -1;
+	return open(path, O_RDONLY | O_CLOEXEC);
+}
+
+static int
+open_window_directory(const struct Terminal *terminal)
+{
+	pid_t foreground = tcgetpgrp(terminal->fd);
+	int directory_fd = open_process_directory(foreground);
+
+	if (directory_fd < 0 && foreground != terminal->pid)
+		directory_fd = open_process_directory(terminal->pid);
+	return directory_fd;
+}
+
 static void
-new_shell(void)
+ring_bell(void)
+{
+	ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
+	(void)ignored;
+}
+
+static void
+new_shell(bool inherit_directory)
 {
 	char *arguments[] = {(char *)shell_path(), NULL};
+	int directory_fd = -1;
 
-	if (!add_window(arguments)) {
-		ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
-		(void)ignored;
+	if (inherit_directory) {
+		directory_fd = open_window_directory(windows[active_window]);
+		if (directory_fd < 0)
+			goto failed;
 	}
+
+	if (add_window(arguments, directory_fd))
+		return;
+
+failed:
+	ring_bell();
 }
 
 static size_t
@@ -2830,9 +2887,8 @@ edit_scrollback(void)
 	char *path = save_scrollback(windows[active_window]);
 	char *arguments[] = {"/bin/sh", "-c", "exec ${EDITOR:-vi} \"$1\"",
 	                     "mwin-editor", path, NULL};
-	ssize_t ignored;
 
-	if (path != NULL && add_window(arguments)) {
+	if (path != NULL && add_window(arguments, -1)) {
 		windows[active_window]->temporary_path = path;
 		return;
 	}
@@ -2840,8 +2896,7 @@ edit_scrollback(void)
 		(void)unlink(path);
 		free(path);
 	}
-	ignored = write(STDOUT_FILENO, "\a", 1);
-	(void)ignored;
+	ring_bell();
 }
 
 static void
@@ -2948,7 +3003,10 @@ handle_command(unsigned char byte)
 	}
 	switch (binding) {
 	case KEY_NEW:
-		new_shell();
+		new_shell(false);
+		break;
+	case KEY_NEW_CWD:
+		new_shell(true);
 		break;
 	case KEY_LAST:
 		select_previous_window();
@@ -3458,7 +3516,7 @@ main(int argc, char **argv)
 		initial_shell[1] = NULL;
 		initial_command = initial_shell;
 	}
-	if (!add_window(initial_command))
+	if (!add_window(initial_command, -1))
 		fatal("cannot create terminal");
 	event_loop();
 	cleanup();

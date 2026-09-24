@@ -96,6 +96,13 @@ def mode_editor():
     wait_forever()
 
 
+def mode_cwd():
+    os.chdir(sys.argv[2])
+    title("CWD-READY")
+    write(b"CWD-READY")
+    wait_forever()
+
+
 def mode_host_modes():
     tty.setraw(sys.stdin.fileno(), when=termios.TCSANOW)
     write(b"\033[?1h\033=\033[?2004h\033[?1004h\033[?1002h\033[?1006h")
@@ -160,12 +167,13 @@ def main():
         "wrap": mode_wrap,
         "alternate": mode_alternate,
         "capture": mode_capture,
+        "cwd": mode_cwd,
         "editor": mode_editor,
         "group": mode_group,
         "host-modes": mode_host_modes,
     }
     if (len(sys.argv) < 2 or sys.argv[1] not in modes or
-            len(sys.argv) != (3 if sys.argv[1] == "editor" else 2)):
+            len(sys.argv) != (3 if sys.argv[1] in ("cwd", "editor") else 2)):
         raise SystemExit("usage: probe.py %s" % "|".join(sorted(modes)))
     modes[sys.argv[1]]()
 

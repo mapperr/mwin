@@ -78,6 +78,7 @@ The default command prefix is `Ctrl-o`:
 | Key | Action |
 | --- | --- |
 | `Ctrl-o m` | create a shell window |
+| `Ctrl-o M` | create a shell window in the current window's directory |
 | `Ctrl-o o` | return to the previously visited window |
 | `Ctrl-o Ctrl-n` | select the next window |
 | `Ctrl-o Ctrl-p` | select the previous window |
@@ -96,6 +97,14 @@ the status line is disabled with `-s`.
 Repeated `Ctrl-o o` commands toggle between the two most recently visited
 windows. Creating a window counts as visiting it; closing a remembered window
 clears that reference safely.
+
+`Ctrl-o M` obtains the working directory from the foreground process of the
+current PTY and falls back to the window's main process. It opens the directory
+before forking and uses the descriptor in the child, so renames and long paths
+do not introduce a race. This command requires Linux procfs; if neither process
+can be inspected, no window is created and the terminal bell is rung. An `ssh`
+window consequently supplies the local directory of the `ssh` process, not the
+remote shell's directory.
 
 The prefix can still be changed at runtime. `^G`, `g`, and decimal byte values
 are accepted:
@@ -162,7 +171,7 @@ The default is 2000 rows per window and can be changed in `config.h`.
 ## Environment
 
 - `SHELL`: shell created by `Ctrl-o m`; falls back to the login shell and then
-  `/bin/sh`.
+  `/bin/sh`. It is also used by `Ctrl-o M`.
 - `EDITOR`: command used by the editor bindings; defaults to `vi`.
 - `MWIN_SCROLLBACK`: maximum retained rows per window; defaults to 2000 and
   accepts `0` to disable history.
@@ -184,6 +193,7 @@ Unset variables retain the defaults shown below. `-c` takes precedence over
 | --- | --- | --- |
 | `MWIN_PREFIX` | `^O` | begin a window command |
 | `MWIN_KEY_NEW` | `m` | create a shell window |
+| `MWIN_KEY_NEW_CWD` | `M` | create a shell in the current window's directory |
 | `MWIN_KEY_LAST` | `o` | visit the previous window |
 | `MWIN_KEY_NEXT` | `^N` | select the next window |
 | `MWIN_KEY_PREV` | `^P` | select the previous window |

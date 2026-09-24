@@ -1,6 +1,6 @@
 .POSIX:
 
-VERSION = 0.3.9
+VERSION = 0.3.10
 PREFIX = /usr/local
 MANPREFIX = $(PREFIX)/share/man
 
@@ -35,6 +35,9 @@ coverage: clean
 	./mwin --model-test
 	$(PYTHON) tests/integration.py
 	gcov -b -c tests/model.c -o mwin-model.gcno
+
+static: LDFLAGS += -static
+static: clean mwin
 
 install: mwin
 	mkdir -p "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(MANPREFIX)/man1"
