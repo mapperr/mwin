@@ -91,7 +91,7 @@ enum BindingId {
 	SCROLL_LINE_FORWARD,
 	SCROLL_EDITOR,
 	SCROLL_OLDEST,
-	SCROLL_LIVE,
+	SCROLL_BOTTOM,
 	SCROLL_ESCAPE,
 	BINDING_COUNT
 };
@@ -131,7 +131,7 @@ static struct KeyBinding bindings[BINDING_COUNT] = {
 	[SCROLL_LINE_FORWARD] = {"MWIN_SCROLL_LINE_FORWARD", 'j',            SCOPE_SCROLLBACK},
 	[SCROLL_EDITOR]       = {"MWIN_SCROLL_EDITOR",       'e',            SCOPE_SCROLLBACK},
 	[SCROLL_OLDEST]       = {"MWIN_SCROLL_OLDEST",       'g',            SCOPE_SCROLLBACK},
-	[SCROLL_LIVE]         = {"MWIN_SCROLL_LIVE",         'G',            SCOPE_SCROLLBACK},
+	[SCROLL_BOTTOM]       = {"MWIN_SCROLL_LIVE",         'G',            SCOPE_SCROLLBACK},
 	[SCROLL_ESCAPE]       = {"MWIN_SCROLL_ESCAPE",       '\033',         SCOPE_SCROLLBACK}
 };
 
@@ -276,6 +276,7 @@ struct Terminal {
 	struct Buffer input;
 	struct History history;
 	size_t scroll_offset;
+	bool scrollback_active;
 	bool viewport_dirty;
 	char title[64];
 	bool unread;
@@ -1585,7 +1586,7 @@ history_push(struct Terminal *terminal, const struct Cell *cells, int columns,
 		}
 	}
 	overwriting = history->count == history->capacity;
-	viewing_oldest = terminal->scroll_offset != 0 &&
+	viewing_oldest = terminal->scrollback_active &&
 	                 terminal->scroll_offset == history->count;
 	if (overwriting) {
 		index = history->head;
@@ -1596,7 +1597,7 @@ history_push(struct Terminal *terminal, const struct Cell *cells, int columns,
 		history->count++;
 	}
 	history->lines[index] = line;
-	if (terminal->scroll_offset != 0) {
+	if (terminal->scrollback_active) {
 		if (terminal->scroll_offset < history->count)
 			terminal->scroll_offset++;
 		if (overwriting && viewing_oldest)
@@ -2264,7 +2265,7 @@ append_status(struct Buffer *output)
 		char key[4];
 		output_printf(&status, " prefix %s: waiting for key",
 		              key_text(command_prefix, key));
-	} else if (windows[active_window]->scroll_offset != 0) {
+	} else if (windows[active_window]->scrollback_active) {
 		const char *title = windows[active_window]->title[0] == '\0' ?
 		                    "shell" : windows[active_window]->title;
 		output_printf(&status,
@@ -2280,8 +2281,8 @@ append_status(struct Buffer *output)
 		                    SCROLL_LINE_FORWARD, " line");
 		append_binding_text(&status, "  ", SCROLL_EDITOR, " editor");
 		append_binding_pair(&status, SCROLL_OLDEST,
-		                    SCROLL_LIVE, " oldest/live");
-		append_binding_text(&status, "  ", SCROLL_ESCAPE, " live");
+		                    SCROLL_BOTTOM, " oldest/bottom");
+		append_binding_text(&status, "  ", SCROLL_ESCAPE, " exit");
 	} else for (i = 0; i < window_count; i++) {
 		const char *title = windows[i]->title[0] == '\0' ? "shell" : windows[i]->title;
 		output_printf(&status, "%s%s%zu:%s%s",
@@ -2470,7 +2471,7 @@ render(bool full)
 		mark_all_dirty(screen);
 	}
 	append_host_modes(&output, terminal);
-	if (terminal->scroll_offset != 0) {
+	if (terminal->scrollback_active) {
 		if (full || terminal->viewport_dirty) {
 			append_viewport(&output, terminal);
 			terminal->viewport_dirty = false;
@@ -2500,7 +2501,8 @@ render(bool full)
 	append_status(&output);
 	if (help_visible)
 		append_help(&output);
-	if (screen->cursor_visible && !help_visible && terminal->scroll_offset == 0) {
+	if (screen->cursor_visible && !help_visible &&
+	    !terminal->scrollback_active) {
 		(void)output_printf(&output, "\033[%d;%dH\033[?25h",
 		                    screen->row + 1, screen->col + 1);
 	} else {
@@ -2904,6 +2906,7 @@ scroll_backward(struct Terminal *terminal, size_t amount)
 {
 	if (terminal->screen != &terminal->primary || terminal->history.count == 0)
 		return;
+	terminal->scrollback_active = true;
 	if (amount > terminal->history.count - terminal->scroll_offset)
 		terminal->scroll_offset = terminal->history.count;
 	else
@@ -2913,23 +2916,34 @@ scroll_backward(struct Terminal *terminal, size_t amount)
 }
 
 static void
-scroll_to_live(struct Terminal *terminal)
+scroll_to_bottom(struct Terminal *terminal)
 {
 	bool changed = terminal->scroll_offset != 0;
 
 	terminal->scroll_offset = 0;
-	terminal->viewport_dirty = false;
+	terminal->viewport_dirty = changed;
 	if (changed)
 		render(true);
 }
 
 static void
+leave_scrollback(struct Terminal *terminal)
+{
+	if (!terminal->scrollback_active)
+		return;
+	terminal->scrollback_active = false;
+	terminal->scroll_offset = 0;
+	terminal->viewport_dirty = false;
+	render(true);
+}
+
+static void
 scroll_forward(struct Terminal *terminal, size_t amount)
 {
-	if (terminal->scroll_offset == 0)
+	if (!terminal->scrollback_active || terminal->scroll_offset == 0)
 		return;
 	if (amount >= terminal->scroll_offset) {
-		scroll_to_live(terminal);
+		scroll_to_bottom(terminal);
 		return;
 	}
 	terminal->scroll_offset -= amount;
@@ -2976,9 +2990,11 @@ handle_scrollback_key(struct Terminal *terminal, unsigned char byte)
 	case SCROLL_OLDEST:
 		scroll_backward(terminal, terminal->history.count);
 		break;
-	case SCROLL_LIVE:
+	case SCROLL_BOTTOM:
+		scroll_to_bottom(terminal);
+		break;
 	case SCROLL_ESCAPE:
-		scroll_to_live(terminal);
+		leave_scrollback(terminal);
 		break;
 	default:
 		break;
@@ -3057,7 +3073,7 @@ handle_regular_input(unsigned char byte)
 		prefix_pending = true;
 		if (status_enabled)
 			render(false);
-	} else if (windows[active_window]->scroll_offset != 0) {
+	} else if (windows[active_window]->scrollback_active) {
 		handle_scrollback_key(windows[active_window], byte);
 	} else {
 		(void)buffer_append(&windows[active_window]->input, &byte, 1);
@@ -3124,7 +3140,7 @@ handle_input(const unsigned char *data, size_t length)
 			continue;
 		}
 		if (!input_is_paste && byte == '\033' &&
-		    windows[active_window]->scroll_offset != 0) {
+		    windows[active_window]->scrollback_active) {
 			handle_regular_input(byte);
 			scroll_escape_sequence[0] = byte;
 			scroll_escape_length = 1;

@@ -40,6 +40,20 @@ KEY_ENVIRONMENT = (
 )
 
 
+def child_cwd_is_visible():
+    process = subprocess.Popen(["sleep", "30"])
+    try:
+        try:
+            descriptor = os.open("/proc/%d/cwd" % process.pid, os.O_RDONLY)
+        except OSError:
+            return False
+        os.close(descriptor)
+        return True
+    finally:
+        process.terminate()
+        process.wait()
+
+
 class HostScreen:
     """Small model of the subset of VT output emitted by mwin itself."""
 
@@ -507,6 +521,8 @@ class TerminalInterfaceTests(unittest.TestCase):
             self.assertEqual(session.wait_exit(), 0)
 
     def test_new_window_can_inherit_the_current_directory(self):
+        if not child_cwd_is_visible():
+            self.skipTest("the test environment hides other processes' cwd")
         cases = ((b"M", {}), (b"N", {"MWIN_KEY_NEW_CWD": "N"}))
         for key, extra in cases:
             with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
@@ -641,17 +657,21 @@ class TerminalInterfaceTests(unittest.TestCase):
                     session.send(half_forward)
                     session.wait_status("scroll 3/5")
                     session.send(page_forward)
-                    session.wait_status("[1:LINES-")
+                    session.wait_status("scroll 0/5")
                     self.assertEqual(session.screen.lines(0, 4),
                                      ["L08", "L09", "L10", "L11", "LIVE"])
+                    session.send(b"x")
                     session.command(enter)
                     session.wait_status("scroll 2/5")
+                    self.assertNotIn("HEX-78", session.screen.line(5))
                     session.send(oldest)
                     session.wait_status("scroll 5/5")
                     session.send(live)
-                    session.wait_status("[1:LINES-")
-                    session.command(enter)
-                    session.wait_status("scroll 2/5")
+                    session.wait_status("scroll 0/5")
+                    session.send(line_back)
+                    session.wait_status("scroll 1/5")
+                    session.send(live)
+                    session.wait_status("scroll 0/5")
                     session.send(escape)
                     session.wait_status("[1:LINES-")
                     session.send(b"x")
@@ -673,6 +693,12 @@ class TerminalInterfaceTests(unittest.TestCase):
             session.command(b"1")
             session.wait_status("scroll 2/8")
             self.assertEqual(session.screen.lines(0, 4), expected)
+            session.send(b"G")
+            session.wait_status("scroll 0/8")
+            session.command(b"2")
+            session.wait_status("[2:sh]")
+            session.command(b"1")
+            session.wait_status("scroll 0/8")
 
     def test_edit_scrollback_with_editor(self):
         captured = b"H0\nH1\nabcdefghij\nKLMN\nEND"
@@ -730,6 +756,14 @@ class TerminalInterfaceTests(unittest.TestCase):
             os.kill(child_pid, signal.SIGUSR1)
             session.wait_status("scroll 3/9")
             self.assertEqual(session.screen.line(0), "L06")
+            session.send(b"G")
+            session.wait_status("scroll 0/9")
+            expected = session.screen.lines(0, 4)
+            os.kill(child_pid, signal.SIGUSR1)
+            session.wait_status("scroll 1/10")
+            self.assertEqual(session.screen.lines(0, 4), expected)
+            session.send(b"\x1b")
+            session.wait_status("[1:LINES-")
 
     def test_zero_scrollback_never_enters_browse_mode(self):
         with self.probe("lines", rows=6, columns=60,

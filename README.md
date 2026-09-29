@@ -129,12 +129,18 @@ Each window has an independent in-memory history. While browsing it:
 | `j` | one row downward/newer |
 | `e` | open the retained scrollback in `$EDITOR` |
 | `g` | oldest retained row |
-| `G` | live terminal |
+| `G` | bottom of the scrollback, without leaving it |
 | `Esc` | leave scrollback and return to the live terminal |
 
 Window commands remain available with the usual prefix while browsing. The
 scrollback position belongs to the window, so switching away and back restores
 the same view.
+
+Forward movement stops at the current output without leaving scrollback; the
+status then shows `scroll 0/N`. `G` jumps directly to that position, while
+`Esc` is the explicit command that returns input and the cursor to the child.
+If new output arrives at the bottom, the visible view remains anchored and its
+offset grows from zero.
 
 `e` (while browsing) and `Ctrl-o Ctrl-e` (from any view) write a plain-text
 snapshot of the retained history and live screen, join soft-wrapped rows, and
@@ -211,8 +217,11 @@ Unset variables retain the defaults shown below. `-c` takes precedence over
 | `MWIN_SCROLL_LINE_FORWARD` | `j` | one row forward |
 | `MWIN_SCROLL_EDITOR` | `e` | open scrollback in the editor |
 | `MWIN_SCROLL_OLDEST` | `g` | oldest retained row |
-| `MWIN_SCROLL_LIVE` | `G` | live terminal |
-| `MWIN_SCROLL_ESCAPE` | `27` | live terminal |
+| `MWIN_SCROLL_LIVE` | `G` | bottom of scrollback, keeping it active |
+| `MWIN_SCROLL_ESCAPE` | `27` | leave scrollback |
+
+The existing `MWIN_SCROLL_LIVE` name is retained for compatibility; its key
+now means "move to the bottom" and no longer leaves scrollback.
 
 For example:
 

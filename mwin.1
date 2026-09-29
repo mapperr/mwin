@@ -1,4 +1,4 @@
-.TH MWIN 1 "September 2026" "mwin 0.3.10" "User Commands"
+.TH MWIN 1 "September 2026" "mwin 0.3.11" "User Commands"
 .SH NAME
 mwin \- minimal fullscreen terminal window manager
 .SH SYNOPSIS
@@ -108,10 +108,16 @@ Open a plain-text snapshot of the retained scrollback in the editor.
 Move to the oldest retained row.
 .TP
 .B G
-Return to the live terminal.
+Move to the current output without leaving scrollback.
 .TP
 .B Escape
 Leave scrollback and return to the live terminal.
+.PP
+Forward movement stops at the current output and leaves scrollback active; the
+status displays an offset of zero. G moves there directly. Escape is the
+explicit command that returns input and the cursor to the child. New output
+that arrives at offset zero moves the offset backward to preserve the visible
+view.
 .PP
 Prefixed window commands remain available while browsing. The scrollback
 position is retained independently when switching away from a window and is
@@ -158,6 +164,9 @@ Scrollback binding variables: MWIN_SCROLL_HALF_BACK,
 MWIN_SCROLL_HALF_FORWARD, MWIN_SCROLL_PAGE_BACK, MWIN_SCROLL_PAGE_FORWARD,
 MWIN_SCROLL_LINE_BACK, MWIN_SCROLL_LINE_FORWARD, MWIN_SCROLL_EDITOR,
 MWIN_SCROLL_OLDEST, MWIN_SCROLL_LIVE, and MWIN_SCROLL_ESCAPE.
+.PP
+MWIN_SCROLL_LIVE retains its existing name for compatibility; its key now
+moves to the bottom without leaving scrollback.
 .PP
 Each binding value is one literal byte, a caret form such as ^U, or a decimal
 value from 0 through 255. Unset variables retain the keys documented above.
