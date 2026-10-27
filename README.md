@@ -30,6 +30,17 @@ make
 sudo make install
 ```
 
+A static executable can be requested without changing the Makefile:
+
+```sh
+make clean
+make LDFLAGS=-static
+```
+
+This requires static archives for libc and the other system libraries. It is
+normally straightforward on musl-based systems; glibc may warn that account
+lookup through `getpwuid` still depends on matching NSS libraries at runtime.
+
 Copy `config.def.h` to `config.h` before building to change compile-time
 defaults. `make` creates the copy automatically when it is absent.
 
@@ -184,6 +195,52 @@ The default is 2000 rows per window and can be changed in `config.h`.
 - `TERM`: describes the hosting terminal. Children receive the value configured
   as `CHILD_TERM`, `screen-256color` by default.
 - `MWIN`: set to `1` in child processes.
+
+### Terminal type and window titles
+
+The `TERM` inherited by mwin describes the hosting terminal, such as foot. It
+is deliberately not propagated to child applications: they communicate with
+mwin's virtual terminal rather than directly with the host. Advertising
+`TERM=foot`, for example, could make an application emit capabilities that
+mwin does not implement. The stable `screen-256color` default can be changed by
+setting `CHILD_TERM` in `config.h`; a dedicated terminfo entry is not required.
+
+OSC 0 and OSC 2 sequences emitted by an application update that window's title
+in the status line. A title remains in effect until another sequence replaces
+it. OSC titles have no lifetime or automatic restore operation, so a remote
+shell may leave an SSH title such as `user@server: ~` behind after logout when
+the local shell does not set a new one.
+
+The simplest fix is to make the local shell publish its title whenever it
+displays a prompt. For Bash, the following `.bashrc` fragment is limited to
+mwin sessions, preserves an existing `PROMPT_COMMAND`, and shows only the last
+component of the current directory:
+
+```bash
+if [ "${MWIN:-}" = 1 ]; then
+    __mwin_set_title() {
+        local dir=${PWD##*/}
+
+        [ -n "$dir" ] || dir=/
+        [ "$PWD" = "$HOME" ] && dir='~'
+
+        printf '\033]0;%s: %s\007' "${0##*/}" "$dir"
+    }
+
+    case ";${PROMPT_COMMAND-};" in
+        *';__mwin_set_title;'*) ;;
+        *) PROMPT_COMMAND="__mwin_set_title${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+    esac
+fi
+```
+
+This produces titles such as `bash: project`, uses only Bash parameter
+expansion, and does not execute `basename` or create a subprocess. To display
+only `project`, omit the shell name from the final command:
+
+```bash
+printf '\033]0;%s\007' "$dir"
+```
 
 ### Configurable keys
 
