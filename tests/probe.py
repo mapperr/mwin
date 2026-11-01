@@ -22,14 +22,22 @@ def wait_forever():
         signal.pause()
 
 
-def mode_env():
+def environment_text():
     size = os.get_terminal_size(sys.stdout.fileno())
-    text = "ENV-%dx%d-%s-%s" % (
+    return "ENV-%dx%d-%s-%s" % (
         size.lines,
         size.columns,
         os.environ.get("TERM", ""),
         os.environ.get("MWIN", ""),
     )
+
+
+def mode_env():
+    def resized(_signum, _frame):
+        title(environment_text())
+
+    signal.signal(signal.SIGWINCH, resized)
+    text = environment_text()
     title(text)
     write(text.encode("ascii"))
     wait_forever()

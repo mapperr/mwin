@@ -305,6 +305,7 @@ static size_t paste_match_length;
 static unsigned char scroll_escape_sequence[sizeof(paste_begin) - 1];
 static size_t scroll_escape_length;
 static bool status_enabled = SHOW_STATUS != 0;
+static bool status_gap;
 static unsigned char command_prefix = MWIN_CTRL(COMMAND_KEY);
 static size_t scrollback_limit = DEFAULT_SCROLLBACK;
 static int host_rows = 24;
@@ -321,6 +322,16 @@ static void history_push(struct Terminal *terminal, const struct Cell *cells,
 static void history_clear(struct Terminal *terminal);
 static bool decode_utf8(const char *text, size_t length, size_t *offset,
                         uint32_t *codepoint);
+
+static int
+terminal_rows(void)
+{
+	int reserved = status_enabled && host_rows > 1 ? 1 : 0;
+
+	if (reserved != 0 && status_gap && host_rows > 2)
+		reserved++;
+	return host_rows - reserved;
+}
 
 static struct Attr
 default_attr(void)
@@ -2261,6 +2272,8 @@ append_status(struct Buffer *output)
 
 	if (!status_enabled || host_rows < 2)
 		return;
+	if (terminal_rows() + 1 < host_rows)
+		(void)output_printf(output, "\033[%d;1H\033[K", host_rows - 1);
 	if (prefix_pending) {
 		char key[4];
 		output_printf(&status, " prefix %s: waiting for key",
@@ -2613,7 +2626,7 @@ spawn_terminal(char *const argv[], int directory_fd)
 		close(master);
 		return NULL;
 	}
-	size.ws_row = (unsigned short)(host_rows - (status_enabled && host_rows > 1 ? 1 : 0));
+	size.ws_row = (unsigned short)terminal_rows();
 	size.ws_col = (unsigned short)host_cols;
 	size.ws_xpixel = 0;
 	size.ws_ypixel = 0;
@@ -3217,7 +3230,7 @@ resize_all(void)
 		if (size.ws_col != 0)
 			host_cols = size.ws_col;
 	}
-	rows = host_rows - (status_enabled && host_rows > 1 ? 1 : 0);
+	rows = terminal_rows();
 	cols = host_cols;
 	if (rows < 1)
 		rows = 1;
@@ -3471,6 +3484,18 @@ invalid:
 	exit(2);
 }
 
+static bool
+status_gap_from_environment(void)
+{
+	const char *text = getenv("MWIN_STATUS_GAP");
+
+	if (text == NULL || strcmp(text, "0") == 0)
+		return false;
+	if (strcmp(text, "1") == 0)
+		return true;
+	fprintf(stderr, "mwin: invalid MWIN_STATUS_GAP value: %s\n", text);
+	exit(2);
+}
 
 static void
 usage(FILE *stream)
@@ -3522,6 +3547,7 @@ main(int argc, char **argv)
 		return 2;
 	}
 	scrollback_limit = scrollback_from_environment();
+	status_gap = status_gap_from_environment();
 	enter_terminal();
 	install_signals();
 	resize_all();

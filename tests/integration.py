@@ -38,6 +38,7 @@ KEY_ENVIRONMENT = (
     "MWIN_SCROLL_EDITOR", "MWIN_SCROLL_OLDEST", "MWIN_SCROLL_LIVE",
     "MWIN_SCROLL_ESCAPE",
 )
+CONFIG_ENVIRONMENT = (*KEY_ENVIRONMENT, "MWIN_SCROLLBACK", "MWIN_STATUS_GAP")
 
 
 def child_cwd_is_visible():
@@ -218,7 +219,7 @@ class MwinSession:
         self._set_size(rows, columns)
         self.original_termios = termios.tcgetattr(master)
         env = os.environ.copy()
-        for name in KEY_ENVIRONMENT:
+        for name in CONFIG_ENVIRONMENT:
             env.pop(name, None)
         env.setdefault("LC_ALL", "C")
         if environment:
@@ -323,7 +324,7 @@ class MwinSession:
 class CommandLineTests(unittest.TestCase):
     def run_mwin(self, *arguments, environment=None):
         env = os.environ.copy()
-        for name in KEY_ENVIRONMENT:
+        for name in CONFIG_ENVIRONMENT:
             env.pop(name, None)
         if environment:
             env.update(environment)
@@ -373,6 +374,13 @@ class CommandLineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(b"invalid MWIN_SCROLLBACK", result.stderr)
 
+    def test_invalid_status_gap(self):
+        for value in ("", "-1", "2", "true"):
+            with self.subTest(value=value):
+                result = self.run_mwin(environment={"MWIN_STATUS_GAP": value})
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"invalid MWIN_STATUS_GAP", result.stderr)
+
     def test_old_config_header_still_compiles(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "compat.o"
@@ -397,6 +405,22 @@ class TerminalInterfaceTests(unittest.TestCase):
                          rows=8, columns=50) as session:
             session.wait_text("ENV-8x50-screen-256color-1")
             self.assertNotIn("1:", session.screen.line(7))
+
+    def test_status_gap_reserves_one_blank_row(self):
+        environment = {"MWIN_STATUS_GAP": "1"}
+        with self.probe("env", rows=8, columns=50,
+                        environment=environment) as session:
+            session.wait_status("ENV-6x50-screen-256color-1")
+            self.assertEqual(session.screen.line(6), "")
+            session.resize(10, 50)
+            session.wait_status("ENV-8x50-screen-256color-1")
+            self.assertEqual(session.screen.line(8), "")
+            session.resize(2, 50)
+            session.wait_status("ENV-1x50-screen-256color-1")
+        with MwinSession(["-s", sys.executable, PROBE, "env"],
+                         rows=8, columns=50,
+                         environment=environment) as session:
+            session.wait_text("ENV-8x50-screen-256color-1")
 
     def test_prefix_help_redraw_and_literal_prefix(self):
         environment = {"MWIN_PROBE_BYTES": "1"}

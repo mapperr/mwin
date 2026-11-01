@@ -30,16 +30,13 @@ make
 sudo make install
 ```
 
-A static executable can be requested without changing the Makefile:
-
-```sh
-make clean
-make LDFLAGS=-static
-```
-
-This requires static archives for libc and the other system libraries. It is
-normally straightforward on musl-based systems; glibc may warn that account
-lookup through `getpwuid` still depends on matching NSS libraries at runtime.
+Normal builds are linked statically, including `make`, `make test`, and the
+binary installed by `make install`. This requires static archives for libc and
+the other system libraries. It is normally straightforward on musl-based
+systems; glibc may warn that account lookup through `getpwuid` still depends on
+matching NSS libraries at runtime. The sanitizer-only `make debug` target is
+the intentional exception because AddressSanitizer cannot produce a fully
+static executable.
 
 Copy `config.def.h` to `config.h` before building to change compile-time
 defaults. `make` creates the copy automatically when it is absent.
@@ -192,6 +189,9 @@ The default is 2000 rows per window and can be changed in `config.h`.
 - `EDITOR`: command used by the editor bindings; defaults to `vi`.
 - `MWIN_SCROLLBACK`: maximum retained rows per window; defaults to 2000 and
   accepts `0` to disable history.
+- `MWIN_STATUS_GAP`: set to `1` to leave one blank row above the status line;
+  defaults to `0`. The gap is omitted on terminals shorter than three rows and
+  has no effect with `-s`.
 - `TERM`: describes the hosting terminal. Children receive the value configured
   as `CHILD_TERM`, `screen-256color` by default.
 - `MWIN`: set to `1` in child processes.
