@@ -38,6 +38,20 @@ matching NSS libraries at runtime. The sanitizer-only `make debug` target is
 the intentional exception because AddressSanitizer cannot produce a fully
 static executable.
 
+The stock Termux toolchain links against Android's Bionic libc and does not
+provide the startup objects or `libc.a` required by `-static`. Build explicitly
+as a native dynamic Termux executable instead:
+
+```sh
+pkg install clang make python
+make STATIC=0
+make STATIC=0 test
+make STATIC=0 install PREFIX="$PREFIX"
+```
+
+`STATIC=1` remains the default everywhere; there is no silent dynamic
+fallback. `STATIC` accepts only `0` or `1`.
+
 Copy `config.def.h` to `config.h` before building to change compile-time
 defaults. `make` creates the copy automatically when it is absent.
 

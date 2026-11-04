@@ -1,16 +1,23 @@
 .POSIX:
 
-VERSION = 0.3.13
+VERSION = 0.3.14
 PREFIX = /usr/local
 MANPREFIX = $(PREFIX)/share/man
 
 CC = cc
 PYTHON = python3
+STATIC ?= 1
 CPPFLAGS = -DVERSION=\"$(VERSION)\"
 CFLAGS = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wconversion -O2
 LDFLAGS =
-STATIC_LDFLAGS = -static
+STATIC_LDFLAGS = $(STATIC_LDFLAGS_$(STATIC))
+STATIC_LDFLAGS_0 =
+STATIC_LDFLAGS_1 = -static
 LDLIBS =
+
+ifeq ($(filter $(STATIC),0 1),)
+$(error STATIC must be 0 or 1)
+endif
 
 all: mwin
 
@@ -25,7 +32,7 @@ tests/model-test: tests/model.c mwin.c config.h
 
 debug: CFLAGS = -std=c99 -pedantic -Wall -Wextra -Wshadow -Wconversion -O0 -g3 -fsanitize=address,undefined
 debug: LDFLAGS = -fsanitize=address,undefined
-debug: STATIC_LDFLAGS =
+debug: STATIC = 0
 debug: clean mwin tests/model-test
 
 test: mwin tests/model-test
