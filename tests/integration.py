@@ -38,7 +38,8 @@ KEY_ENVIRONMENT = (
     "MWIN_SCROLL_EDITOR", "MWIN_SCROLL_OLDEST", "MWIN_SCROLL_LIVE",
     "MWIN_SCROLL_ESCAPE",
 )
-CONFIG_ENVIRONMENT = (*KEY_ENVIRONMENT, "MWIN_SCROLLBACK", "MWIN_STATUS_GAP")
+CONFIG_ENVIRONMENT = (*KEY_ENVIRONMENT, "MWIN_SCROLLBACK", "MWIN_STATUS_GAP",
+                      "MWIN_STATUS_FORMAT")
 
 
 def child_cwd_is_visible():
@@ -210,7 +211,8 @@ class HostScreen:
 
 
 class MwinSession:
-    def __init__(self, arguments, rows=8, columns=60, environment=None, prefix=CTRL_O):
+    def __init__(self, arguments, rows=8, columns=60, environment=None, prefix=CTRL_O,
+                 status_format="title-path"):
         master, slave = os.openpty()
         self.master = master
         self.prefix = prefix
@@ -221,6 +223,9 @@ class MwinSession:
         env = os.environ.copy()
         for name in CONFIG_ENVIRONMENT:
             env.pop(name, None)
+        # Existing interface tests use OSC titles as synchronization markers.
+        if status_format is not None:
+            env["MWIN_STATUS_FORMAT"] = status_format
         env.setdefault("LC_ALL", "C")
         if environment:
             env.update(environment)
@@ -381,6 +386,13 @@ class CommandLineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(b"invalid MWIN_STATUS_GAP", result.stderr)
 
+    def test_invalid_status_format(self):
+        for value in ("", "invalid", "1", "TITLE", "title "):
+            with self.subTest(value=value):
+                result = self.run_mwin(environment={"MWIN_STATUS_FORMAT": value})
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"invalid MWIN_STATUS_FORMAT", result.stderr)
+
     def test_old_config_header_still_compiles(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "compat.o"
@@ -397,6 +409,52 @@ class CommandLineTests(unittest.TestCase):
 class TerminalInterfaceTests(unittest.TestCase):
     def probe(self, mode, **kwargs):
         return MwinSession([sys.executable, PROBE, mode], **kwargs)
+
+    def test_status_formats_and_activity(self):
+        for mode, label in ((None, "1"), ("number", "1"),
+                            ("title", "1:bash"),
+                            ("title-path", "1:bash: /tmp/project")):
+            with self.subTest(mode=mode), self.probe(
+                    "status", status_format=mode,
+                    environment={"SHELL": "/bin/sh",
+                                 "PS1": "SHELL-READY> "}) as session:
+                session.wait_text("STATUS-")
+                session.wait_status("[%s]" % label)
+                self.assertEqual(session.screen.line(7), "[%s]" % label)
+                pid = int(re.search(r"STATUS-(\d+)",
+                                    " ".join(session.screen.lines())).group(1))
+                session.command(b"m")
+                second = "2" if mode in (None, "number") else "2:sh"
+                session.wait_status("[%s]" % second)
+                session.wait_text("SHELL-READY>")
+                os.kill(pid, signal.SIGUSR1)
+                session.wait_status("%s*  [%s]" % (label, second))
+                session.command(b"1")
+                session.wait_status("[%s]" % label)
+                self.assertEqual(session.screen.line(7),
+                                 "[%s]  %s" % (label, second))
+
+    def test_title_without_path_separator(self):
+        for title in ("editor", "host:/tmp/project", ""):
+            with self.subTest(title=title), self.probe(
+                    "status", status_format="title",
+                    environment={"MWIN_PROBE_TITLE": title}) as session:
+                session.wait_text("STATUS-")
+                self.assertEqual(session.screen.line(7),
+                                 "[1:%s]" % (title or "shell"))
+
+    def test_scrollback_status_formats(self):
+        for mode, label in ((None, "1"), ("title", "1:bash"),
+                            ("title-path", "1:bash: /tmp/project")):
+            with self.subTest(mode=mode), MwinSession(
+                    ["/bin/sh", "-c",
+                     "printf '\033]2;bash: /tmp/project\007'; "
+                     "i=0; while [ $i -lt 12 ]; do echo line; i=$((i+1)); done; "
+                     "echo STATUS-READY; exec sleep 30"], status_format=mode) as session:
+                session.wait_text("STATUS-READY")
+                session.wait_status("[%s]" % label)
+                session.command(b"\x15")
+                session.wait_status("[%s] scroll " % label)
 
     def test_child_environment_and_terminal_size(self):
         with self.probe("env", rows=8, columns=50) as session:

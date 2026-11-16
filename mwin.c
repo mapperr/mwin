@@ -62,6 +62,12 @@ enum BindingScope {
 	SCOPE_SCROLLBACK
 };
 
+enum StatusFormat {
+	STATUS_NUMBER,
+	STATUS_TITLE,
+	STATUS_TITLE_PATH
+};
+
 enum BindingId {
 	KEY_NEW,
 	KEY_NEW_CWD,
@@ -306,6 +312,7 @@ static unsigned char scroll_escape_sequence[sizeof(paste_begin) - 1];
 static size_t scroll_escape_length;
 static bool status_enabled = SHOW_STATUS != 0;
 static bool status_gap;
+static enum StatusFormat status_format = STATUS_NUMBER;
 static unsigned char command_prefix = MWIN_CTRL(COMMAND_KEY);
 static size_t scrollback_limit = DEFAULT_SCROLLBACK;
 static int host_rows = 24;
@@ -2265,6 +2272,25 @@ append_bar(struct Buffer *output, const char *text, size_t length)
 }
 
 static void
+append_window_label(struct Buffer *output, size_t index)
+{
+	const char *title = windows[index]->title[0] == '\0' ?
+	                    "shell" : windows[index]->title;
+	const char *separator;
+	size_t length = strlen(title);
+
+	(void)output_printf(output, "%zu", index + 1);
+	if (status_format == STATUS_NUMBER)
+		return;
+	/* Shell titles conventionally contain "program: directory". */
+	separator = status_format == STATUS_TITLE ? strstr(title, ": ") : NULL;
+	if (separator != NULL)
+		length = (size_t)(separator - title);
+	(void)output_append(output, ":");
+	(void)buffer_append(output, title, length);
+}
+
+static void
 append_status(struct Buffer *output)
 {
 	struct Buffer status = {0};
@@ -2279,11 +2305,10 @@ append_status(struct Buffer *output)
 		output_printf(&status, " prefix %s: waiting for key",
 		              key_text(command_prefix, key));
 	} else if (windows[active_window]->scrollback_active) {
-		const char *title = windows[active_window]->title[0] == '\0' ?
-		                    "shell" : windows[active_window]->title;
+		(void)output_append(&status, "[");
+		append_window_label(&status, active_window);
 		output_printf(&status,
-		              "[%zu:%s] scroll %zu/%zu",
-		              active_window + 1, title,
+		              "] scroll %zu/%zu",
 		              windows[active_window]->scroll_offset,
 		              windows[active_window]->history.count);
 		append_binding_pair(&status, SCROLL_HALF_BACK,
@@ -2297,11 +2322,12 @@ append_status(struct Buffer *output)
 		                    SCROLL_BOTTOM, " oldest/bottom");
 		append_binding_text(&status, "  ", SCROLL_ESCAPE, " exit");
 	} else for (i = 0; i < window_count; i++) {
-		const char *title = windows[i]->title[0] == '\0' ? "shell" : windows[i]->title;
-		output_printf(&status, "%s%s%zu:%s%s",
-		              i == 0 ? "" : "  ", i == active_window ? "[" : "",
-		              i + 1, title, i == active_window ? "]" :
-		              (windows[i]->unread ? "*" : ""));
+		(void)output_append(&status, i == 0 ? "" : "  ");
+		if (i == active_window)
+			(void)output_append(&status, "[");
+		append_window_label(&status, i);
+		(void)output_append(&status, i == active_window ? "]" :
+		                    (windows[i]->unread ? "*" : ""));
 		if (status.length >= (size_t)host_cols)
 			break;
 	}
@@ -3497,6 +3523,21 @@ status_gap_from_environment(void)
 	exit(2);
 }
 
+static enum StatusFormat
+status_format_from_environment(void)
+{
+	const char *text = getenv("MWIN_STATUS_FORMAT");
+
+	if (text == NULL || strcmp(text, "number") == 0)
+		return STATUS_NUMBER;
+	if (strcmp(text, "title") == 0)
+		return STATUS_TITLE;
+	if (strcmp(text, "title-path") == 0)
+		return STATUS_TITLE_PATH;
+	fprintf(stderr, "mwin: invalid MWIN_STATUS_FORMAT value: %s\n", text);
+	exit(2);
+}
+
 static void
 usage(FILE *stream)
 {
@@ -3548,6 +3589,7 @@ main(int argc, char **argv)
 	}
 	scrollback_limit = scrollback_from_environment();
 	status_gap = status_gap_from_environment();
+	status_format = status_format_from_environment();
 	enter_terminal();
 	install_signals();
 	resize_all();

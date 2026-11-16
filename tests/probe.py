@@ -60,6 +60,13 @@ def mode_input():
     wait_forever()
 
 
+def mode_status():
+    signal.signal(signal.SIGUSR1, lambda _signum, _frame: write(b"ACTIVITY"))
+    title(os.environ.get("MWIN_PROBE_TITLE", "bash: /tmp/project"))
+    write(("STATUS-%d" % os.getpid()).encode("ascii"))
+    wait_forever()
+
+
 def mode_lines():
     pid = os.getpid()
     tty.setraw(sys.stdin.fileno(), when=termios.TCSANOW)
@@ -171,6 +178,7 @@ def main():
         "env": mode_env,
         "exit": mode_exit,
         "input": mode_input,
+        "status": mode_status,
         "lines": mode_lines,
         "wrap": mode_wrap,
         "alternate": mode_alternate,

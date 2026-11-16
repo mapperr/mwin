@@ -18,6 +18,9 @@ as an ordinary command inside a window when split panes are needed.
 .PP
 One row is reserved for a window list unless disabled with
 .BR \-s .
+By default, it shows window numbers, with brackets around the selected window
+and an asterisk for unseen activity in another window. Selecting a window
+clears its activity marker. MWIN_STATUS_FORMAT can add window titles.
 MWIN_STATUS_GAP can reserve an additional blank separator row.
 .SH OPTIONS
 .TP
@@ -184,6 +187,16 @@ Set to 1 to reserve one blank row between the child terminal and the status
 line. The default is 0. The gap is omitted when the host is too short to leave
 at least one row for the child, and it has no effect with
 .BR \-s .
+.TP
+.B MWIN_STATUS_FORMAT
+Window label format: number (the default), title, or title-path.
+The number is always shown. The title format adds the application's OSC 0/2
+title up to the first colon followed by a space, following the shell convention
+"program: directory". Titles without that separator are shown in full.
+The title-path format adds the complete OSC title, preserving the previous
+display, including any directory supplied by the shell. No separate path is
+looked up or appended. The same format applies in scrollback. For example:
+[1], [1:bash], or [1:bash: project]. Invalid values are rejected.
 .TP
 .B TERM
 Describes the hosting terminal. Child terminals receive screen-256color by

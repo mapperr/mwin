@@ -40,7 +40,7 @@ if ! grep -aF 'prefix ^O: waiting for key' "$tmp" >/dev/null; then
 	echo "prefix: pending status not observed" >&2
 	exit 1
 fi
-if ! grep -aF '[1:sleep]  2:' "$tmp" >/dev/null; then
+if ! grep -aF '[1]  2' "$tmp" >/dev/null; then
 	echo "windows: previous window was not selected" >&2
 	exit 1
 fi

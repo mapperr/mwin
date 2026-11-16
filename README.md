@@ -203,6 +203,12 @@ The default is 2000 rows per window and can be changed in `config.h`.
 - `EDITOR`: command used by the editor bindings; defaults to `vi`.
 - `MWIN_SCROLLBACK`: maximum retained rows per window; defaults to 2000 and
   accepts `0` to disable history.
+- `MWIN_STATUS_FORMAT`: `number` (the default) shows only window numbers;
+  `title` adds the title without the directory suffix; `title-path` adds the
+  complete title, preserving the previous display. The selected window is
+  enclosed in brackets, and `*` marks unseen activity in another window until
+  it is selected. For example: `[1]  2*`, `[1:bash]  2:vi*`, or
+  `[1:bash: project]  2:vi*`.
 - `MWIN_STATUS_GAP`: set to `1` to leave one blank row above the status line;
   defaults to `0`. The gap is omitted on terminals shorter than three rows and
   has no effect with `-s`.
@@ -219,8 +225,14 @@ mwin's virtual terminal rather than directly with the host. Advertising
 mwin does not implement. The stable `screen-256color` default can be changed by
 setting `CHILD_TERM` in `config.h`; a dedicated terminfo entry is not required.
 
-OSC 0 and OSC 2 sequences emitted by an application update that window's title
-in the status line. A title remains in effect until another sequence replaces
+OSC 0 and OSC 2 sequences emitted by an application update that window's title.
+Set `MWIN_STATUS_FORMAT=title` or `MWIN_STATUS_FORMAT=title-path` to display it
+in the status line. The `title` format omits everything from the first `: `
+onward, following the shell convention `program: directory`; titles without
+that separator are displayed in full. The `title-path` format displays the
+complete OSC title, including any directory supplied by the shell; mwin does
+not look up or append a separate path. The same format applies in scrollback.
+A title remains in effect until another sequence replaces
 it. OSC titles have no lifetime or automatic restore operation, so a remote
 shell may leave an SSH title such as `user@server: ~` behind after logout when
 the local shell does not set a new one.
